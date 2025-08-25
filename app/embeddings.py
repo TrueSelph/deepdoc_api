@@ -1,3 +1,5 @@
+"""Embedding client for generating embeddings using JivasEmbeddings service"""
+
 import logging
 from typing import List, Optional
 
@@ -9,7 +11,10 @@ logger = logging.getLogger(__name__)
 
 # In app/embeddings.py
 class EmbeddingClient:
-    def __init__(self):
+    """Embedding client for generating embeddings using JivasEmbeddings service"""
+
+    def __init__(self) -> None:
+        """Initialize the EmbeddingClient with JivasEmbeddings service"""
         self.url = settings.EMBEDDING_SERVICE_URL
         self.api_key = settings.EMBEDDING_SERVICE_API_KEY
         self.model = (

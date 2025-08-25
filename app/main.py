@@ -1,3 +1,5 @@
+"""Entrypoint for the DeepDoc API"""
+
 import asyncio
 import datetime
 import json
@@ -9,12 +11,12 @@ import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from typing import AsyncIterator, Dict, List
+from typing import Any, AsyncIterator, Dict, List, Tuple
 from urllib.parse import unquote, urlparse
 
 import aiofiles  # type: ignore
 import requests
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, HTTPException, UploadFile
 
 from app.config import settings
 from app.models import (
@@ -22,7 +24,6 @@ from app.models import (
     ChunkResult,
     JobStatus,
     JobStatusResponse,
-    UploadChunkRequest,
 )
 from app.processing import document_processor
 
@@ -41,9 +42,7 @@ processing_tasks: Dict[str, asyncio.Task] = {}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """
-    Lifespan context manager for application startup and shutdown events.
-    """
+    """Lifespan context manager for application startup and shutdown events."""
     global executor
 
     # Startup logic
@@ -115,7 +114,9 @@ def get_filename_from_response(response: requests.Response, url: str) -> str:
     return filename
 
 
-async def download_file_from_url(url: str, output_dir: str, job_id: str) -> tuple:
+async def download_file_from_url(
+    url: str, output_dir: str, job_id: str
+) -> Tuple[str, str]:
     """Download a file from a URL and return (file_path, original_filename)"""
 
     try:
@@ -165,8 +166,11 @@ async def download_file_from_url(url: str, output_dir: str, job_id: str) -> tupl
 
 
 async def download_google_drive_file(
-    url: str, output_dir: str, job_id: str, gdown_module
-) -> tuple:
+    url: str,
+    output_dir: str,
+    job_id: str,
+    gdown_module: Any,  # noqa: ANN401
+) -> Tuple[str, str]:
     """Download a file from Google Drive using gdown"""
     try:
         # Extract file ID from Google Drive URL
@@ -210,7 +214,7 @@ async def save_upload_file(upload_file: UploadFile, destination: str) -> str:
     return upload_file.filename  # Return the original filename, not the saved path
 
 
-async def process_job(job_id: str, file_paths: List[str], params: dict):
+async def process_job(job_id: str, file_paths: List[str], params: dict) -> None:
     """Background task to process documents for a job with cancellation support"""
     # Create cancellation event for this job
     cancellation_event = threading.Event()
@@ -298,7 +302,7 @@ async def process_job(job_id: str, file_paths: List[str], params: dict):
             del processing_tasks[job_id]
 
 
-async def trigger_callback(job_id: str, callback_url: str):
+async def trigger_callback(job_id: str, callback_url: str) -> None:
     """Send job result to callback URL with proper error handling"""
     try:
         import requests
@@ -356,7 +360,7 @@ async def trigger_callback(job_id: str, callback_url: str):
 
 async def _retry_callback_with_simple_payload(
     job_id: str, callback_url: str, job_data: dict
-):
+) -> None:
     """Retry callback with a simpler payload structure for compatibility"""
     try:
         import requests
@@ -393,14 +397,14 @@ async def _retry_callback_with_simple_payload(
 @app.post("/upload_and_chunk")
 async def upload_and_chunk_endpoint(
     background_tasks: BackgroundTasks,
-    files: List[UploadFile] = File(None),
-    urls: List[str] = Form(None),
-    from_page: int = Form(0),
-    to_page: int = Form(100000),
-    lang: str = Form("english"),
-    with_embeddings: bool = Form(False),
-    callback_url: str = Form(None),
-):
+    files: List[UploadFile] | None = None,
+    urls: List[str] | None = None,
+    from_page: int = 0,
+    to_page: int = 100000,
+    lang: str = "english",
+    with_embeddings: bool = False,
+    callback_url: str | None = None,
+) -> Dict[str, str]:
     """Endpoint to process files asynchronously from uploads or URLs"""
     # Generate job ID
     job_id = str(uuid.uuid4())
@@ -473,7 +477,7 @@ async def upload_and_chunk_endpoint(
 
 
 @app.get("/job/{job_id}")
-async def get_job_status_endpoint(job_id: str):
+async def get_job_status_endpoint(job_id: str) -> JobStatusResponse:
     """Endpoint to check the status of a job"""
     job = jobs.get(job_id)
     if not job:
@@ -530,7 +534,7 @@ async def get_job_status_endpoint(job_id: str):
 
 # Add the cancel endpoint
 @app.post("/job/{job_id}/cancel")
-async def cancel_job(job_id: str):
+async def cancel_job(job_id: str) -> Dict[str, object]:
     """Cancel a job - always returns success even if job doesn't exist or can't be cancelled"""
     # Check if job exists
     if job_id not in jobs:
@@ -581,7 +585,7 @@ async def cancel_job(job_id: str):
     }
 
 
-async def cleanup_job_files(job_id: str):
+async def cleanup_job_files(job_id: str) -> None:
     """Clean up files associated with a cancelled job"""
     try:
         # Find and delete any files that start with the job ID
@@ -600,7 +604,7 @@ async def cleanup_job_files(job_id: str):
 
 
 @app.get("/health")
-async def health_check():
+async def health_check() -> Dict[str, object]:
     """Enhanced health check endpoint"""
     # Check if embedding service is available if configured
     if settings.EMBEDDING_SERVICE_URL:
@@ -635,7 +639,7 @@ async def health_check():
 
 
 @app.get("/liveness")
-async def liveness_check():
+async def liveness_check() -> Dict[str, str]:
     """Lightweight health check endpoint"""
     return {"status": "alive"}
 

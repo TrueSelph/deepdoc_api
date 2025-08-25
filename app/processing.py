@@ -6,6 +6,7 @@ import os
 import re
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from multiprocessing.connection import Connection
 from typing import Any, Dict, List, Optional, Set
 
 from app.embeddings import embedding_client
@@ -203,7 +204,7 @@ class DocumentProcessor:
         for attr in ("pages", "page_numbers", "page_nums", "page_no"):
             val = getattr(dl_chunk, attr, None)
             if val:
-                try:
+                with contextlib.suppress(Exception):
                     if isinstance(val, (list, tuple, set)):
                         for p in val:
                             try:
@@ -213,8 +214,6 @@ class DocumentProcessor:
                                 pass
                     elif isinstance(val, int):
                         pages.add(val if val >= 1 else val + 1)
-                except Exception:
-                    pass
 
         # Check for source_spans or spans with page indices
         spans = getattr(dl_chunk, "source_spans", None) or getattr(
@@ -463,10 +462,8 @@ class DocumentProcessor:
             if proc.is_alive():
                 proc.terminate()
             proc.join(timeout=5)
-            try:
+            with contextlib.suppress(Exception):
                 parent_conn.close()
-            except Exception:
-                pass
 
         if not isinstance(result, dict):
             raise RuntimeError("Invalid result type from Docling worker")
@@ -619,11 +616,9 @@ def _docling_worker_process(file_path: str, conn) -> None:
         conn.close()
 
     except Exception as e:
-        try:
+        with contextlib.suppress(Exception):
             conn.send({"ok": False, "error": f"{type(e).__name__}: {e}"})
             conn.close()
-        except Exception:
-            pass
 
 
 def _collect_chunk_pages(dl_chunk) -> List[int]:
@@ -641,7 +636,7 @@ def _collect_chunk_pages(dl_chunk) -> List[int]:
     for attr in ("pages", "page_numbers", "page_nums"):
         val = getattr(dl_chunk, attr, None)
         if val:
-            try:
+            with contextlib.suppress(Exception):
                 if isinstance(val, (list, tuple, set)):
                     for p in val:
                         try:
@@ -651,8 +646,6 @@ def _collect_chunk_pages(dl_chunk) -> List[int]:
                             pass
                 elif isinstance(val, int):
                     pages.add(val if val >= 1 else val + 1)
-            except Exception:
-                pass
 
     # Check for source_spans or spans with page indices
     spans = getattr(dl_chunk, "source_spans", None) or getattr(dl_chunk, "spans", None)
@@ -674,7 +667,7 @@ def _collect_chunk_pages(dl_chunk) -> List[int]:
         for attr in ("pages", "page_numbers", "page_nums"):
             meta_pages = getattr(meta, attr, None)
             if meta_pages:
-                try:
+                with contextlib.suppress(Exception):
                     if isinstance(meta_pages, (list, tuple, set)):
                         for p in meta_pages:
                             try:
@@ -684,8 +677,6 @@ def _collect_chunk_pages(dl_chunk) -> List[int]:
                                 pass
                     elif isinstance(meta_pages, int):
                         pages.add(meta_pages if meta_pages >= 1 else meta_pages + 1)
-                except Exception:
-                    pass
 
     if not pages:
         pages = {1}
