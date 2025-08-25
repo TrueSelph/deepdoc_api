@@ -1,7 +1,6 @@
 from enum import Enum
-from typing import Any, Dict, List, Optional, Union
+from typing import Dict, List, Optional
 
-from fastapi import UploadFile
 from pydantic import BaseModel, Field
 
 
@@ -16,7 +15,7 @@ class JobStatus(str, Enum):
 class ChunkMetadata(BaseModel):
     page_num_int: List[int] = Field(default_factory=list)
     original_filename: str
-    # Additional metadata fields can be added here
+    bbox: Optional[Dict[str, float]] = None
     chunk_size: Optional[int] = None
     chunk_overlap: Optional[int] = None
 

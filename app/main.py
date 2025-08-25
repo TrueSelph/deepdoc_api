@@ -499,9 +499,7 @@ async def get_job_status_endpoint(job_id: str):
                     chunk_results.append(ChunkResult(**chunk_data))
                 else:
                     # Old format - convert to new format
-                    chunk_id = chunk_data.get(
-                        "id", f"chunk_{len(chunk_results) + 1:03d}"
-                    )
+                    chunk_id = chunk_data.get("id", f"chunk_{os.urandom(8).hex()}")
                     metadata = ChunkMetadata(
                         page_num_int=[1],  # Default page
                         original_filename=chunk_data.get("metadata", {}).get(

@@ -6,3 +6,8 @@
 uploads/
 #Processed folder
 processed/
+# Python #
+*.pyc
+__pycache__
+venv
+.pytest_cache

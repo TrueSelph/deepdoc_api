@@ -1,6 +1,9 @@
+"""Document processing module with Docling integration."""
+
 import logging
 import multiprocessing as mp
 import os
+import re
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Set
@@ -22,12 +25,10 @@ if sys.platform == "darwin":
 
 
 class DocumentProcessor:
-    """
-    Document processor that uses Docling's DocumentConverter and HybridChunker
-    to produce coherent chunks with contextualization.
-    """
+    """Document processor using Docling's DocumentConverter and HybridChunker."""
 
-    def __init__(self):
+    def __init__(self) -> None:
+        """Initialize the DocumentProcessor with supported formats and thread pool."""
         self.supported_formats = [
             ".pdf",
             ".docx",
@@ -42,7 +43,15 @@ class DocumentProcessor:
         self.embedding_executor = ThreadPoolExecutor(max_workers=3)
 
     def process_document(self, file_path: str, params: dict) -> List[ChunkResult]:
-        """Process a single document using Docling's DocumentConverter and HybridChunker"""
+        """Process a single document using Docling's DocumentConverter and HybridChunker.
+
+        Args:
+            file_path: Path to the document file
+            params: Processing parameters dictionary
+
+        Returns:
+            List of processed chunks with metadata
+        """
         original_filename = self._resolve_original_filename(file_path, params)
 
         # On macOS, use a direct approach to avoid fork issues with MPS
@@ -52,7 +61,9 @@ class DocumentProcessor:
                 return self._process_directly(file_path, original_filename, params)
             except Exception as e:
                 logger.error(
-                    f"Direct processing failed for {file_path}: {e}. Falling back."
+                    "Direct processing failed for %s: %s. Falling back.",
+                    file_path,
+                    e,
                 )
                 fallback_processor = FallbackDocumentProcessor()
                 return fallback_processor.process_document(
@@ -79,7 +90,7 @@ class DocumentProcessor:
 
         except Exception as e:
             logger.error(
-                f"Docling processing failed for {file_path}: {e}. Falling back."
+                "Docling processing failed for %s: %s. Falling back.", file_path, e
             )
             fallback_processor = FallbackDocumentProcessor()
             return fallback_processor.process_document(
@@ -89,7 +100,16 @@ class DocumentProcessor:
     def _process_directly(
         self, file_path: str, original_filename: str, params: dict
     ) -> List[ChunkResult]:
-        """Process document directly without multiprocessing (for macOS)"""
+        """Process document directly without multiprocessing (for macOS).
+
+        Args:
+            file_path: Path to the document file
+            original_filename: Original filename without job ID prefix
+            params: Processing parameters dictionary
+
+        Returns:
+            List of processed chunks with metadata
+        """
         try:
             from docling.chunking import HybridChunker
             from docling.document_converter import DocumentConverter
@@ -120,13 +140,20 @@ class DocumentProcessor:
             # Extract page information
             pages = self._collect_chunk_pages(chunk)
 
-            chunk_id = f"chunk_{i+1:03d}"
+            # Extract bounding box data
+            bbox_data = self._collect_bounding_box(chunk)
+
+            chunk_id = f"chunk_{os.urandom(8).hex()}"
             metadata = ChunkMetadata(
                 page_num_int=pages,
                 original_filename=original_filename,
                 chunk_size=len(text),
                 chunk_overlap=0,
             )
+
+            # Add bounding box to metadata if available
+            if bbox_data:
+                metadata.bbox = bbox_data
 
             chunks.append(ChunkResult(id=chunk_id, metadata=metadata, text=text))
 
@@ -137,11 +164,43 @@ class DocumentProcessor:
         return chunks
 
     def _collect_chunk_pages(self, dl_chunk) -> List[int]:
-        """Collect 1-based page numbers from a docling chunk."""
+        """Collect 1-based page numbers from a docling chunk.
+
+        Args:
+            dl_chunk: Docling chunk object
+
+        Returns:
+            Sorted list of page numbers
+        """
         pages: Set[int] = set()
 
+        # First, try to extract from metadata provenance (most reliable)
+        meta = getattr(dl_chunk, "metadata", None) or getattr(dl_chunk, "meta", None)
+        if meta is not None:
+            # Check for provenance information in meta
+            prov = getattr(meta, "prov", None)
+            if prov and hasattr(prov, "__iter__"):
+                for provenance_item in prov:
+                    page_no = getattr(provenance_item, "page_no", None)
+                    if page_no is not None:
+                        try:
+                            p_int = int(page_no)
+                            # Page numbers are typically 1-based
+                            pages.add(p_int if p_int >= 1 else p_int + 1)
+                        except (ValueError, TypeError):
+                            pass
+
+            # Also check for direct page_no attribute in meta
+            page_no = getattr(meta, "page_no", None)
+            if page_no is not None:
+                try:
+                    p_int = int(page_no)
+                    pages.add(p_int if p_int >= 1 else p_int + 1)
+                except (ValueError, TypeError):
+                    pass
+
         # Try different attributes that might contain page information
-        for attr in ("pages", "page_numbers", "page_nums"):
+        for attr in ("pages", "page_numbers", "page_nums", "page_no"):
             val = getattr(dl_chunk, attr, None)
             if val:
                 try:
@@ -163,39 +222,201 @@ class DocumentProcessor:
         )
         if spans:
             for sp in spans:
-                for attr in ("page", "page_idx", "page_number", "page_num"):
+                for attr in ("page", "page_idx", "page_number", "page_num", "page_no"):
                     page_idx = getattr(sp, attr, None)
                     if page_idx is not None:
                         try:
                             p_int = int(page_idx)
-                            pages.add(p_int + 1)  # assume 0-based in spans
+                            # Assume 0-based in spans, convert to 1-based
+                            pages.add(p_int + 1 if p_int >= 0 else 1)
                             break
                         except (ValueError, TypeError):
                             pass
 
-        # Check metadata for page information
-        meta = getattr(dl_chunk, "metadata", None) or getattr(dl_chunk, "meta", None)
+        # Additional check: look for page information in doc_items if present
         if meta is not None:
-            for attr in ("pages", "page_numbers", "page_nums"):
-                meta_pages = getattr(meta, attr, None)
-                if meta_pages:
-                    try:
-                        if isinstance(meta_pages, (list, tuple, set)):
-                            for p in meta_pages:
+            doc_items = getattr(meta, "doc_items", None)
+            if doc_items and hasattr(doc_items, "__iter__"):
+                for doc_item in doc_items:
+                    prov = getattr(doc_item, "prov", None)
+                    if prov and hasattr(prov, "__iter__"):
+                        for provenance_item in prov:
+                            page_no = getattr(provenance_item, "page_no", None)
+                            if page_no is not None:
                                 try:
-                                    p_int = int(p)
+                                    p_int = int(page_no)
                                     pages.add(p_int if p_int >= 1 else p_int + 1)
                                 except (ValueError, TypeError):
                                     pass
-                        elif isinstance(meta_pages, int):
-                            pages.add(meta_pages if meta_pages >= 1 else meta_pages + 1)
-                    except Exception:
-                        pass
 
+        # If no pages found, try to get from the chunk's text content or context
+        if not pages:
+            # Last resort: check if we can infer from the chunk's string representation
+            chunk_str = str(dl_chunk)
+            page_match = re.search(
+                r"page[_\s]*(no|num|number)?[_\s]*[=:]\s*(\d+)",
+                chunk_str,
+                re.IGNORECASE,
+            )
+            if page_match:
+                try:
+                    page_no = int(page_match.group(2))
+                    pages.add(page_no if page_no >= 1 else page_no + 1)
+                except (ValueError, TypeError):
+                    pass
+
+        # Final fallback if no pages detected
         if not pages:
             pages = {1}
 
         return sorted(pages)
+
+    def _collect_bounding_box(self, dl_chunk) -> Optional[Dict[str, float]]:
+        """Collect bounding box data from a docling chunk.
+
+        Args:
+            dl_chunk: Docling chunk object
+
+        Returns:
+            Dictionary with bounding box coordinates or None if not available
+        """
+        bbox_data = None
+
+        # First, try to extract from metadata provenance (most reliable)
+        meta = getattr(dl_chunk, "metadata", None) or getattr(dl_chunk, "meta", None)
+        if meta is not None:
+            # Check for provenance information in meta
+            prov = getattr(meta, "prov", None)
+            if prov and hasattr(prov, "__iter__"):
+                for provenance_item in prov:
+                    bbox = getattr(provenance_item, "bbox", None)
+                    if bbox is not None:
+                        bbox_data = self._extract_bbox_from_object(bbox)
+                        if bbox_data:
+                            break
+
+            # Also check for direct bbox attribute in meta
+            if bbox_data is None:
+                bbox = getattr(meta, "bbox", None)
+                if bbox is not None:
+                    bbox_data = self._extract_bbox_from_object(bbox)
+
+        # Check for bounding box in the chunk itself
+        if bbox_data is None:
+            for attr in ("bbox", "bounding_box", "boundingbox", "rect", "rectangle"):
+                bbox = getattr(dl_chunk, attr, None)
+                if bbox is not None:
+                    bbox_data = self._extract_bbox_from_object(bbox)
+                    if bbox_data:
+                        break
+
+        # Check for source_spans or spans with bounding box
+        if bbox_data is None:
+            spans = getattr(dl_chunk, "source_spans", None) or getattr(
+                dl_chunk, "spans", None
+            )
+            if spans:
+                for sp in spans:
+                    for attr in (
+                        "bbox",
+                        "bounding_box",
+                        "boundingbox",
+                        "rect",
+                        "rectangle",
+                    ):
+                        bbox = getattr(sp, attr, None)
+                        if bbox is not None:
+                            bbox_data = self._extract_bbox_from_object(bbox)
+                            if bbox_data:
+                                break
+                    if bbox_data:
+                        break
+
+        # Additional check: look for bounding box in doc_items if present
+        if bbox_data is None and meta is not None:
+            doc_items = getattr(meta, "doc_items", None)
+            if doc_items and hasattr(doc_items, "__iter__"):
+                for doc_item in doc_items:
+                    prov = getattr(doc_item, "prov", None)
+                    if prov and hasattr(prov, "__iter__"):
+                        for provenance_item in prov:
+                            bbox = getattr(provenance_item, "bbox", None)
+                            if bbox is not None:
+                                bbox_data = self._extract_bbox_from_object(bbox)
+                                if bbox_data:
+                                    break
+                        if bbox_data:
+                            break
+
+        return bbox_data
+
+    def _extract_bbox_from_object(self, bbox_obj) -> Optional[Dict[str, float]]:
+        """Extract bounding box coordinates from various bbox object formats.
+
+        Args:
+            bbox_obj: Bounding box object with various attribute naming conventions
+
+        Returns:
+            Dictionary with bounding box coordinates or None if extraction fails
+        """
+        try:
+            # Try different attribute naming patterns
+            bbox_methods = [
+                # l, t, r, b pattern
+                lambda: {
+                    "left": getattr(bbox_obj, "l", None),
+                    "top": getattr(bbox_obj, "t", None),
+                    "right": getattr(bbox_obj, "r", None),
+                    "bottom": getattr(bbox_obj, "b", None),
+                },
+                # x, y, width, height pattern
+                lambda: {
+                    "left": getattr(bbox_obj, "x", None),
+                    "top": getattr(bbox_obj, "y", None),
+                    "right": getattr(bbox_obj, "x", None)
+                    + getattr(bbox_obj, "width", 0),
+                    "bottom": getattr(bbox_obj, "y", None)
+                    + getattr(bbox_obj, "height", 0),
+                },
+                # x1, y1, x2, y2 pattern
+                lambda: {
+                    "left": getattr(bbox_obj, "x1", None),
+                    "top": getattr(bbox_obj, "y1", None),
+                    "right": getattr(bbox_obj, "x2", None),
+                    "bottom": getattr(bbox_obj, "y2", None),
+                },
+                # left, top, right, bottom pattern
+                lambda: {
+                    "left": getattr(bbox_obj, "left", None),
+                    "top": getattr(bbox_obj, "top", None),
+                    "right": getattr(bbox_obj, "right", None),
+                    "bottom": getattr(bbox_obj, "bottom", None),
+                },
+            ]
+
+            for bbox_method in bbox_methods:
+                bbox_coords = bbox_method()
+                # Check if we have all required coordinates
+                if all(coord is not None for coord in bbox_coords.values()):
+                    # Calculate width and height
+                    width = bbox_coords["right"] - bbox_coords["left"]
+                    height = bbox_coords["bottom"] - bbox_coords["top"]
+
+                    # Return complete bbox data
+                    return {
+                        "left": bbox_coords["left"],
+                        "top": bbox_coords["top"],
+                        "right": bbox_coords["right"],
+                        "bottom": bbox_coords["bottom"],
+                        "width": width,
+                        "height": height,
+                        "area": width * height,
+                    }
+
+        except (AttributeError, TypeError, ValueError) as e:
+            logger.debug("Failed to extract bbox from object: %s", e)
+
+        return None
 
     def _run_docling_with_timeout(
         self,
@@ -203,9 +424,19 @@ class DocumentProcessor:
         original_filename: str,
         timeout_seconds: int,
     ) -> List[ChunkResult]:
-        """
-        Spawn a worker process to run Docling's DocumentConverter and HybridChunker.
-        Returns a list of ChunkResult or raises on failure/timeout.
+        """Run Docling processing with timeout using multiprocessing.
+
+        Args:
+            file_path: Path to the document file
+            original_filename: Original filename without job ID prefix
+            timeout_seconds: Timeout in seconds
+
+        Returns:
+            List of processed chunks with metadata
+
+        Raises:
+            TimeoutError: If processing times out
+            RuntimeError: If worker returns invalid result or error
         """
         # Use 'spawn' method to avoid fork issues
         ctx = mp.get_context("spawn")
@@ -250,20 +481,35 @@ class DocumentProcessor:
             text = (ch.get("text") or "").strip()
             if not text:
                 continue
-            pages = ch.get("pages") or [1]
-            chunk_id = f"chunk_{idx:03d}"
+            # Collect chunk pages
+            pages = self._collect_chunk_pages(ch)
+            # Extract bounding box data
+            bbox_data = self._collect_bounding_box(ch)
+            chunk_id = f"chunk_{os.urandom(8).hex()}"
             meta = ChunkMetadata(
                 page_num_int=pages,
                 original_filename=original_filename,
                 chunk_size=len(text),
                 chunk_overlap=0,
             )
+            # Add bounding box to metadata if available
+            if bbox_data:
+                meta.bbox = bbox_data
+
             chunks.append(ChunkResult(id=chunk_id, metadata=meta, text=text))
 
         return chunks
 
     def _resolve_original_filename(self, file_path: str, params: dict) -> str:
-        """Resolve original filename from params; strip UUID prefix if present."""
+        """Resolve original filename from params; strip UUID prefix if present.
+
+        Args:
+            file_path: Path to the document file
+            params: Processing parameters dictionary
+
+        Returns:
+            Original filename without job ID prefix
+        """
         original_filenames = params.get("original_filenames", {}) or {}
         original_filename = original_filenames.get(
             file_path, os.path.basename(file_path)
@@ -277,11 +523,15 @@ class DocumentProcessor:
         return original_filename
 
     def _attach_embeddings(self, chunks: List[ChunkResult]) -> None:
-        """Generate embeddings for chunks one at a time to handle large documents"""
+        """Generate embeddings for chunks one at a time to handle large documents.
+
+        Args:
+            chunks: List of chunks to generate embeddings for
+        """
         if not chunks:
             return
 
-        logger.info(f"Generating embeddings for {len(chunks)} chunks...")
+        logger.info("Generating embeddings for %d chunks...", len(chunks))
 
         successful_embeddings = 0
         failed_embeddings = 0
@@ -294,33 +544,36 @@ class DocumentProcessor:
                     chunk.embeddings = embedding
                     successful_embeddings += 1
                 else:
-                    logger.warning(f"Failed to generate embedding for chunk {i+1}")
+                    logger.warning("Failed to generate embedding for chunk %d", i + 1)
                     failed_embeddings += 1
 
                 # Log progress every 10 chunks
                 if (i + 1) % 10 == 0:
-                    logger.info(f"Processed {i+1}/{len(chunks)} chunks for embeddings")
+                    logger.info(
+                        "Processed %d/%d chunks for embeddings", i + 1, len(chunks)
+                    )
 
             except Exception as e:
-                logger.error(f"Error generating embedding for chunk {i+1}: {e}")
+                logger.error("Error generating embedding for chunk %d: %s", i + 1, e)
                 failed_embeddings += 1
                 # Continue with next chunk instead of failing completely
 
         logger.info(
-            f"Embedding generation completed: {successful_embeddings} successful, {failed_embeddings} failed"
+            "Embedding generation completed: %d successful, %d failed",
+            successful_embeddings,
+            failed_embeddings,
         )
 
         if failed_embeddings > 0:
-            logger.warning(f"{failed_embeddings} chunks failed to generate embeddings")
+            logger.warning("%d chunks failed to generate embeddings", failed_embeddings)
 
 
-def _docling_worker_process(
-    file_path: str,
-    conn,
-) -> None:
-    """
-    Worker process entrypoint: uses DocumentConverter and HybridChunker
-    with contextualization for optimal chunking.
+def _docling_worker_process(file_path: str, conn) -> None:
+    """Worker process entrypoint for Docling processing.
+
+    Args:
+        file_path: Path to the document file
+        conn: Pipe connection for communication with parent process
     """
     # Set environment variables to prevent MPS issues
     if sys.platform == "darwin":
@@ -374,7 +627,14 @@ def _docling_worker_process(
 
 
 def _collect_chunk_pages(dl_chunk) -> List[int]:
-    """Collect 1-based page numbers from a docling chunk."""
+    """Collect 1-based page numbers from a docling chunk.
+
+    Args:
+        dl_chunk: Docling chunk object
+
+    Returns:
+        Sorted list of page numbers
+    """
     pages: Set[int] = set()
 
     # Try different attributes that might contain page information
@@ -433,11 +693,11 @@ def _collect_chunk_pages(dl_chunk) -> List[int]:
     return sorted(pages)
 
 
-# Fallback processor remains the same as in your original code
 class FallbackDocumentProcessor:
     """Fallback processor if Docling is not available or times out."""
 
-    def __init__(self):
+    def __init__(self) -> None:
+        """Initialize the FallbackDocumentProcessor with supported formats."""
         self.supported_formats = [
             ".pdf",
             ".docx",
@@ -452,6 +712,16 @@ class FallbackDocumentProcessor:
     def process_document(
         self, file_path: str, params: dict, original_filename: Optional[str] = None
     ) -> List[ChunkResult]:
+        """Process document using fallback methods.
+
+        Args:
+            file_path: Path to the document file
+            params: Processing parameters dictionary
+            original_filename: Original filename without job ID prefix
+
+        Returns:
+            List of processed chunks with metadata
+        """
         try:
             if original_filename is None:
                 original_filename = os.path.basename(file_path)
@@ -484,10 +754,10 @@ class FallbackDocumentProcessor:
             return chunks
 
         except Exception as e:
-            logger.error(f"Fallback processing failed for {file_path}: {e}")
+            logger.error("Fallback processing failed for %s: %s", file_path, e)
             return [
                 ChunkResult(
-                    id="chunk_001",
+                    id=f"chunk_{os.urandom(8).hex()}",
                     metadata=ChunkMetadata(
                         page_num_int=[1],
                         original_filename=original_filename
@@ -498,7 +768,11 @@ class FallbackDocumentProcessor:
             ]
 
     def _attach_embeddings(self, chunks: List[ChunkResult]) -> None:
-        """Generate embeddings for chunks using the external embedding service"""
+        """Generate embeddings for chunks using the external embedding service.
+
+        Args:
+            chunks: List of chunks to generate embeddings for
+        """
         try:
             texts = [c.text for c in chunks]
 
@@ -510,10 +784,18 @@ class FallbackDocumentProcessor:
                 chunk.embeddings = embedding
 
         except Exception as e:
-            logger.error(f"Embedding generation failed: {e}")
+            logger.error("Embedding generation failed: %s", e)
             # Continue without embeddings rather than failing the whole job
 
     def _extract_text_from_pdf(self, file_path: str) -> str:
+        """Extract text from PDF using PyPDF2.
+
+        Args:
+            file_path: Path to the PDF file
+
+        Returns:
+            Extracted text content
+        """
         try:
             import PyPDF2
 
@@ -528,6 +810,14 @@ class FallbackDocumentProcessor:
             return f"PDF content would be extracted here: {os.path.basename(file_path)}"
 
     def _extract_text_from_docx(self, file_path: str) -> str:
+        """Extract text from DOCX using python-docx.
+
+        Args:
+            file_path: Path to the DOCX file
+
+        Returns:
+            Extracted text content
+        """
         try:
             import docx
 
@@ -541,6 +831,14 @@ class FallbackDocumentProcessor:
             )
 
     def _extract_text_from_image(self, file_path: str) -> str:
+        """Extract text from image using Tesseract OCR.
+
+        Args:
+            file_path: Path to the image file
+
+        Returns:
+            Extracted text content
+        """
         try:
             import pytesseract
             from PIL import Image
@@ -554,7 +852,7 @@ class FallbackDocumentProcessor:
             )
             return f"Image OCR content would be extracted here: {os.path.basename(file_path)}"
         except Exception as e:
-            logger.warning(f"OCR failed: {e}")
+            logger.warning("OCR failed: %s", e)
             return f"OCR extraction failed for: {os.path.basename(file_path)}"
 
     def _chunk_content(
@@ -565,6 +863,18 @@ class FallbackDocumentProcessor:
         chunk_size: int = 1000,
         overlap: int = 100,
     ) -> List[ChunkResult]:
+        """Split content into chunks with proper metadata.
+
+        Args:
+            content: Text content to chunk
+            original_filename: Original filename
+            page_info: Page information dictionary
+            chunk_size: Size of each chunk in characters
+            overlap: Overlap between chunks in characters
+
+        Returns:
+            List of chunks with metadata
+        """
         chunks = []
         start = 0
         chunk_count = 0
@@ -581,7 +891,7 @@ class FallbackDocumentProcessor:
 
             chunk_text = content[start:end].strip()
             if chunk_text:
-                chunk_id = f"chunk_{chunk_count:03d}"
+                chunk_id = f"chunk_{os.urandom(8).hex()}"
                 metadata = ChunkMetadata(
                     page_num_int=page_info.get("pages", [1]),
                     original_filename=original_filename,
