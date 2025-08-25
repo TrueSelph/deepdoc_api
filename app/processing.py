@@ -1,12 +1,12 @@
-import os
 import logging
 import multiprocessing as mp
-from typing import List, Dict, Any, Set
+import os
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Dict, List, Optional, Set
 
-from app.models import ChunkResult, ChunkMetadata
 from app.embeddings import embedding_client
+from app.models import ChunkMetadata, ChunkResult
 
 logger = logging.getLogger(__name__)
 
@@ -28,27 +28,40 @@ class DocumentProcessor:
     """
 
     def __init__(self):
-        self.supported_formats = ['.pdf', '.docx', '.pptx', '.html', '.txt', '.jpg', '.jpeg', '.png']
+        self.supported_formats = [
+            ".pdf",
+            ".docx",
+            ".pptx",
+            ".html",
+            ".txt",
+            ".jpg",
+            ".jpeg",
+            ".png",
+        ]
         # Thread pool for embedding generation
         self.embedding_executor = ThreadPoolExecutor(max_workers=3)
 
     def process_document(self, file_path: str, params: dict) -> List[ChunkResult]:
         """Process a single document using Docling's DocumentConverter and HybridChunker"""
         original_filename = self._resolve_original_filename(file_path, params)
-        
+
         # On macOS, use a direct approach to avoid fork issues with MPS
         if sys.platform == "darwin":
             logger.info("Using direct processing on macOS to avoid MPS fork issues")
             try:
                 return self._process_directly(file_path, original_filename, params)
             except Exception as e:
-                logger.error(f"Direct processing failed for {file_path}: {e}. Falling back.")
+                logger.error(
+                    f"Direct processing failed for {file_path}: {e}. Falling back."
+                )
                 fallback_processor = FallbackDocumentProcessor()
-                return fallback_processor.process_document(file_path, params, original_filename)
-        
+                return fallback_processor.process_document(
+                    file_path, params, original_filename
+                )
+
         # On other platforms, use the multiprocessing approach with timeout
         timeout_seconds = max(10, int(params.get("timeout_seconds", 180)))
-        
+
         try:
             chunks = self._run_docling_with_timeout(
                 file_path=file_path,
@@ -59,21 +72,27 @@ class DocumentProcessor:
                 raise RuntimeError("Docling worker returned no chunks")
 
             # Generate embeddings if requested
-            if params.get('with_embeddings', False) and chunks:
+            if params.get("with_embeddings", False) and chunks:
                 self._attach_embeddings(chunks)
 
             return chunks
 
         except Exception as e:
-            logger.error(f"Docling processing failed for {file_path}: {e}. Falling back.")
+            logger.error(
+                f"Docling processing failed for {file_path}: {e}. Falling back."
+            )
             fallback_processor = FallbackDocumentProcessor()
-            return fallback_processor.process_document(file_path, params, original_filename)
+            return fallback_processor.process_document(
+                file_path, params, original_filename
+            )
 
-    def _process_directly(self, file_path: str, original_filename: str, params: dict) -> List[ChunkResult]:
+    def _process_directly(
+        self, file_path: str, original_filename: str, params: dict
+    ) -> List[ChunkResult]:
         """Process document directly without multiprocessing (for macOS)"""
         try:
-            from docling.document_converter import DocumentConverter
             from docling.chunking import HybridChunker
+            from docling.document_converter import DocumentConverter
         except ImportError as e:
             raise ImportError(f"Required Docling components not available: {e}")
 
@@ -91,16 +110,16 @@ class DocumentProcessor:
             # Use contextualized text for better results
             enriched_text = chunker.contextualize(chunk=chunk)
             text = (enriched_text or "").strip()
-            
+
             if not text:
                 # Fallback to regular text if contextualization returns empty
                 text = (chunk.text or "").strip()
                 if not text:
                     continue
-            
+
             # Extract page information
             pages = self._collect_chunk_pages(chunk)
-            
+
             chunk_id = f"chunk_{i+1:03d}"
             metadata = ChunkMetadata(
                 page_num_int=pages,
@@ -108,15 +127,11 @@ class DocumentProcessor:
                 chunk_size=len(text),
                 chunk_overlap=0,
             )
-            
-            chunks.append(ChunkResult(
-                id=chunk_id,
-                metadata=metadata,
-                text=text
-            ))
+
+            chunks.append(ChunkResult(id=chunk_id, metadata=metadata, text=text))
 
         # Generate embeddings if requested
-        if params.get('with_embeddings', False) and chunks:
+        if params.get("with_embeddings", False) and chunks:
             self._attach_embeddings(chunks)
 
         return chunks
@@ -143,7 +158,9 @@ class DocumentProcessor:
                     pass
 
         # Check for source_spans or spans with page indices
-        spans = getattr(dl_chunk, "source_spans", None) or getattr(dl_chunk, "spans", None)
+        spans = getattr(dl_chunk, "source_spans", None) or getattr(
+            dl_chunk, "spans", None
+        )
         if spans:
             for sp in spans:
                 for attr in ("page", "page_idx", "page_number", "page_num"):
@@ -191,7 +208,7 @@ class DocumentProcessor:
         Returns a list of ChunkResult or raises on failure/timeout.
         """
         # Use 'spawn' method to avoid fork issues
-        ctx = mp.get_context('spawn')
+        ctx = mp.get_context("spawn")
         parent_conn, child_conn = ctx.Pipe(duplex=False)
         proc = ctx.Process(
             target=_docling_worker_process,
@@ -208,7 +225,9 @@ class DocumentProcessor:
                 # Timeout: terminate and raise
                 proc.terminate()
                 proc.join(timeout=5)
-                raise TimeoutError(f"Docling processing timed out after {timeout_seconds}s")
+                raise TimeoutError(
+                    f"Docling processing timed out after {timeout_seconds}s"
+                )
         finally:
             if proc.is_alive():
                 proc.terminate()
@@ -246,11 +265,13 @@ class DocumentProcessor:
     def _resolve_original_filename(self, file_path: str, params: dict) -> str:
         """Resolve original filename from params; strip UUID prefix if present."""
         original_filenames = params.get("original_filenames", {}) or {}
-        original_filename = original_filenames.get(file_path, os.path.basename(file_path))
+        original_filename = original_filenames.get(
+            file_path, os.path.basename(file_path)
+        )
 
         # Remove job ID prefix if looks like a UUID_ prefix
-        if original_filename and '_' in original_filename:
-            parts = original_filename.split('_', 1)
+        if original_filename and "_" in original_filename:
+            parts = original_filename.split("_", 1)
             if len(parts) > 1 and len(parts[0]) == 36:
                 original_filename = parts[1]
         return original_filename
@@ -259,12 +280,12 @@ class DocumentProcessor:
         """Generate embeddings for chunks one at a time to handle large documents"""
         if not chunks:
             return
-            
+
         logger.info(f"Generating embeddings for {len(chunks)} chunks...")
-        
+
         successful_embeddings = 0
         failed_embeddings = 0
-        
+
         for i, chunk in enumerate(chunks):
             try:
                 # Process one chunk at a time
@@ -275,18 +296,20 @@ class DocumentProcessor:
                 else:
                     logger.warning(f"Failed to generate embedding for chunk {i+1}")
                     failed_embeddings += 1
-                    
+
                 # Log progress every 10 chunks
                 if (i + 1) % 10 == 0:
                     logger.info(f"Processed {i+1}/{len(chunks)} chunks for embeddings")
-                    
+
             except Exception as e:
                 logger.error(f"Error generating embedding for chunk {i+1}: {e}")
                 failed_embeddings += 1
                 # Continue with next chunk instead of failing completely
-                
-        logger.info(f"Embedding generation completed: {successful_embeddings} successful, {failed_embeddings} failed")
-        
+
+        logger.info(
+            f"Embedding generation completed: {successful_embeddings} successful, {failed_embeddings} failed"
+        )
+
         if failed_embeddings > 0:
             logger.warning(f"{failed_embeddings} chunks failed to generate embeddings")
 
@@ -307,8 +330,8 @@ def _docling_worker_process(
     try:
         # Try to import the required components
         try:
-            from docling.document_converter import DocumentConverter
             from docling.chunking import HybridChunker
+            from docling.document_converter import DocumentConverter
         except ImportError as e:
             raise ImportError(f"Required Docling components not available: {e}")
 
@@ -327,21 +350,17 @@ def _docling_worker_process(
             # Use contextualized text for better results
             enriched_text = chunker.contextualize(chunk=chunk)
             text = (enriched_text or "").strip()
-            
+
             if not text:
                 # Fallback to regular text if contextualization returns empty
                 text = (chunk.text or "").strip()
                 if not text:
                     continue
-            
+
             # Extract page information
             pages = _collect_chunk_pages(chunk)
-            
-            out_chunks.append({
-                "text": text, 
-                "pages": pages,
-                "chunk_index": i
-            })
+
+            out_chunks.append({"text": text, "pages": pages, "chunk_index": i})
 
         conn.send({"ok": True, "chunks": out_chunks})
         conn.close()
@@ -419,63 +438,77 @@ class FallbackDocumentProcessor:
     """Fallback processor if Docling is not available or times out."""
 
     def __init__(self):
-        self.supported_formats = ['.pdf', '.docx', '.pptx', '.html', '.txt', '.jpg', '.jpeg', '.png']
+        self.supported_formats = [
+            ".pdf",
+            ".docx",
+            ".pptx",
+            ".html",
+            ".txt",
+            ".jpg",
+            ".jpeg",
+            ".png",
+        ]
 
-    def process_document(self, file_path: str, params: dict, original_filename: str = None) -> List[ChunkResult]:
+    def process_document(
+        self, file_path: str, params: dict, original_filename: Optional[str] = None
+    ) -> List[ChunkResult]:
         try:
             if original_filename is None:
                 original_filename = os.path.basename(file_path)
-                if '_' in original_filename:
-                    parts = original_filename.split('_', 1)
+                if "_" in original_filename:
+                    parts = original_filename.split("_", 1)
                     if len(parts) > 1 and len(parts[0]) == 36:
                         original_filename = parts[1]
 
             file_ext = os.path.splitext(file_path)[1].lower()
             content = ""
-            if file_ext == '.pdf':
+            if file_ext == ".pdf":
                 content = self._extract_text_from_pdf(file_path)
-            elif file_ext == '.docx':
+            elif file_ext == ".docx":
                 content = self._extract_text_from_docx(file_path)
-            elif file_ext in ['.txt', '.html']:
-                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            elif file_ext in [".txt", ".html"]:
+                with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
                     content = f.read()
-            elif file_ext in ['.jpg', '.jpeg', '.png']:
+            elif file_ext in [".jpg", ".jpeg", ".png"]:
                 content = self._extract_text_from_image(file_path)
             else:
                 content = f"Content from {original_filename}"
 
             page_info = {"original_filename": original_filename, "pages": [1]}
             chunks = self._chunk_content(content, original_filename, page_info)
-            
+
             # Generate embeddings if requested
-            if params.get('with_embeddings', False) and chunks:
+            if params.get("with_embeddings", False) and chunks:
                 self._attach_embeddings(chunks)
-                
+
             return chunks
 
         except Exception as e:
             logger.error(f"Fallback processing failed for {file_path}: {e}")
-            return [ChunkResult(
-                id="chunk_001",
-                metadata=ChunkMetadata(
-                    page_num_int=[1],
-                    original_filename=original_filename or os.path.basename(file_path)
-                ),
-                text=f"Error processing document: {str(e)}"
-            )]
-            
+            return [
+                ChunkResult(
+                    id="chunk_001",
+                    metadata=ChunkMetadata(
+                        page_num_int=[1],
+                        original_filename=original_filename
+                        or os.path.basename(file_path),
+                    ),
+                    text=f"Error processing document: {str(e)}",
+                )
+            ]
+
     def _attach_embeddings(self, chunks: List[ChunkResult]) -> None:
         """Generate embeddings for chunks using the external embedding service"""
         try:
             texts = [c.text for c in chunks]
-            
+
             # Use the embedding client to generate embeddings
             embeddings = embedding_client.generate_embeddings(texts)
-            
+
             # Assign embeddings to chunks
             for chunk, embedding in zip(chunks, embeddings):
                 chunk.embeddings = embedding
-                
+
         except Exception as e:
             logger.error(f"Embedding generation failed: {e}")
             # Continue without embeddings rather than failing the whole job
@@ -483,11 +516,12 @@ class FallbackDocumentProcessor:
     def _extract_text_from_pdf(self, file_path: str) -> str:
         try:
             import PyPDF2
+
             text = ""
-            with open(file_path, 'rb') as file:
+            with open(file_path, "rb") as file:
                 reader = PyPDF2.PdfReader(file)
                 for page in reader.pages:
-                    text += (page.extract_text() or "")
+                    text += page.extract_text() or ""
             return text
         except ImportError:
             logger.warning("PyPDF2 not available for PDF extraction")
@@ -496,29 +530,41 @@ class FallbackDocumentProcessor:
     def _extract_text_from_docx(self, file_path: str) -> str:
         try:
             import docx
+
             doc = docx.Document(file_path)
             text = "\n".join([paragraph.text for paragraph in doc.paragraphs])
             return text
         except ImportError:
             logger.warning("python-docx not available for DOCX extraction")
-            return f"DOCX content would be extracted here: {os.path.basename(file_path)}"
+            return (
+                f"DOCX content would be extracted here: {os.path.basename(file_path)}"
+            )
 
     def _extract_text_from_image(self, file_path: str) -> str:
         try:
             import pytesseract
             from PIL import Image
+
             image = Image.open(file_path)
             text = pytesseract.image_to_string(image)
             return text
         except ImportError:
-            logger.warning("Tesseract OCR not available. Install pytesseract and tesseract-ocr")
+            logger.warning(
+                "Tesseract OCR not available. Install pytesseract and tesseract-ocr"
+            )
             return f"Image OCR content would be extracted here: {os.path.basename(file_path)}"
         except Exception as e:
             logger.warning(f"OCR failed: {e}")
             return f"OCR extraction failed for: {os.path.basename(file_path)}"
 
-    def _chunk_content(self, content: str, original_filename: str, page_info: dict,
-                       chunk_size: int = 1000, overlap: int = 100) -> List[ChunkResult]:
+    def _chunk_content(
+        self,
+        content: str,
+        original_filename: str,
+        page_info: dict,
+        chunk_size: int = 1000,
+        overlap: int = 100,
+    ) -> List[ChunkResult]:
         chunks = []
         start = 0
         chunk_count = 0
@@ -529,7 +575,7 @@ class FallbackDocumentProcessor:
             end = min(start + chunk_size, n)
 
             if end < n:
-                break_pos = content.rfind(' ', start, end)
+                break_pos = content.rfind(" ", start, end)
                 if break_pos != -1 and break_pos > start + chunk_size // 2:
                     end = break_pos + 1
 
@@ -540,9 +586,11 @@ class FallbackDocumentProcessor:
                     page_num_int=page_info.get("pages", [1]),
                     original_filename=original_filename,
                     chunk_size=len(chunk_text),
-                    chunk_overlap=overlap if start > 0 else 0
+                    chunk_overlap=overlap if start > 0 else 0,
                 )
-                chunks.append(ChunkResult(id=chunk_id, metadata=metadata, text=chunk_text))
+                chunks.append(
+                    ChunkResult(id=chunk_id, metadata=metadata, text=chunk_text)
+                )
 
             new_start = end - overlap
             start = end if new_start <= start else new_start

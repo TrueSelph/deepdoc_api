@@ -1,7 +1,9 @@
+from enum import Enum
+from typing import Any, Dict, List, Optional, Union
+
 from fastapi import UploadFile
 from pydantic import BaseModel, Field
-from typing import List, Optional, Dict, Any, Union
-from enum import Enum
+
 
 class JobStatus(str, Enum):
     PENDING = "pending"
@@ -10,6 +12,7 @@ class JobStatus(str, Enum):
     FAILED = "failed"
     CANCELLED = "cancelled"
 
+
 class ChunkMetadata(BaseModel):
     page_num_int: List[int] = Field(default_factory=list)
     original_filename: str
@@ -17,16 +20,19 @@ class ChunkMetadata(BaseModel):
     chunk_size: Optional[int] = None
     chunk_overlap: Optional[int] = None
 
+
 class ChunkResult(BaseModel):
     id: str
     metadata: ChunkMetadata
     text: str
     embeddings: Optional[List[float]] = None
 
+
 class JobStatusResponse(BaseModel):
     status: JobStatus
     result: Optional[List[ChunkResult]] = None
     error: Optional[str] = None
+
 
 class UploadChunkRequest(BaseModel):
     agent_id: Optional[str] = None
