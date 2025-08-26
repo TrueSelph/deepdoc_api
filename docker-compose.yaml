@@ -1,0 +1,30 @@
+version: "3.8"
+
+services:
+  docling-api:
+    build: .
+    ports:
+      - "8991:8991"
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - EMBEDDING_SERVICE_URL=${EMBEDDING_SERVICE_URL}
+      - EMBEDDING_SERVICE_API_KEY=${EMBEDDING_SERVICE_API_KEY}
+      - UPLOAD_DIR=/app/uploads
+      - PROCESSED_DIR=/app/processed
+    volumes:
+      - uploads_data:/app/uploads
+      - processed_data:/app/processed
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+volumes:
+  uploads_data:
+  processed_data:
+  redis_data:

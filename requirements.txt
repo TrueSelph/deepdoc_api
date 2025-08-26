@@ -1,0 +1,27 @@
+fastapi
+uvicorn[standard]>=0.24.0
+python-multipart>=0.0.6
+docling[all]>=2.47.1
+transformers
+requests
+pydantic
+python-dotenv
+aiofiles
+redis
+celery
+
+# Add these for fallback document processing
+PyPDF2
+python-docx
+pytesseract
+Pillow
+
+# For JivasEmbeddings
+openai>=1.0.0
+transformers>=4.30.0
+torch>=2.0.0
+langchain-core>=0.1.0
+
+# For URL handling
+requests>=2.28.0
+gdown>=5.2.0
