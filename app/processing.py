@@ -1,5 +1,6 @@
 """Document processing module with Docling integration."""
 
+import contextlib
 import logging
 import multiprocessing as mp
 import os
@@ -127,7 +128,7 @@ class DocumentProcessor:
         chunk_iter = chunker.chunk(dl_doc=doc)
 
         chunks = []
-        for i, chunk in enumerate(chunk_iter):
+        for _i, chunk in enumerate(chunk_iter):
             # Use contextualized text for better results
             enriched_text = chunker.contextualize(chunk=chunk)
             text = (enriched_text or "").strip()
@@ -164,7 +165,7 @@ class DocumentProcessor:
 
         return chunks
 
-    def _collect_chunk_pages(self, dl_chunk) -> List[int]:
+    def _collect_chunk_pages(self, dl_chunk: object) -> List[int]:
         """Collect 1-based page numbers from a docling chunk.
 
         Args:
@@ -270,7 +271,7 @@ class DocumentProcessor:
 
         return sorted(pages)
 
-    def _collect_bounding_box(self, dl_chunk) -> Optional[Dict[str, float]]:
+    def _collect_bounding_box(self, dl_chunk: object) -> Optional[Dict[str, float]]:
         """Collect bounding box data from a docling chunk.
 
         Args:
@@ -349,7 +350,7 @@ class DocumentProcessor:
 
         return bbox_data
 
-    def _extract_bbox_from_object(self, bbox_obj) -> Optional[Dict[str, float]]:
+    def _extract_bbox_from_object(self, bbox_obj: object) -> Optional[Dict[str, float]]:
         """Extract bounding box coordinates from various bbox object formats.
 
         Args:
@@ -372,9 +373,9 @@ class DocumentProcessor:
                 lambda: {
                     "left": getattr(bbox_obj, "x", None),
                     "top": getattr(bbox_obj, "y", None),
-                    "right": getattr(bbox_obj, "x", None)
+                    "right": (getattr(bbox_obj, "x", None) or 0)
                     + getattr(bbox_obj, "width", 0),
-                    "bottom": getattr(bbox_obj, "y", None)
+                    "bottom": (getattr(bbox_obj, "y", None) or 0)
                     + getattr(bbox_obj, "height", 0),
                 },
                 # x1, y1, x2, y2 pattern
@@ -398,15 +399,17 @@ class DocumentProcessor:
                 # Check if we have all required coordinates
                 if all(coord is not None for coord in bbox_coords.values()):
                     # Calculate width and height
-                    width = bbox_coords["right"] - bbox_coords["left"]
-                    height = bbox_coords["bottom"] - bbox_coords["top"]
+                    width = (bbox_coords["right"] or 0.0) - (bbox_coords["left"] or 0.0)
+                    height = (bbox_coords["bottom"] or 0.0) - (
+                        bbox_coords["top"] or 0.0
+                    )
 
                     # Return complete bbox data
                     return {
-                        "left": bbox_coords["left"],
-                        "top": bbox_coords["top"],
-                        "right": bbox_coords["right"],
-                        "bottom": bbox_coords["bottom"],
+                        "left": float(bbox_coords["left"] or 0.0),
+                        "top": float(bbox_coords["top"] or 0.0),
+                        "right": float(bbox_coords["right"] or 0.0),
+                        "bottom": float(bbox_coords["bottom"] or 0.0),
                         "width": width,
                         "height": height,
                         "area": width * height,
@@ -474,7 +477,7 @@ class DocumentProcessor:
         # Convert worker chunk dicts to ChunkResult with metadata
         chunks_dicts: List[Dict[str, Any]] = result.get("chunks", [])
         chunks: List[ChunkResult] = []
-        for idx, ch in enumerate(chunks_dicts, start=1):
+        for _idx, ch in enumerate(chunks_dicts, start=1):
             text = (ch.get("text") or "").strip()
             if not text:
                 continue
@@ -565,7 +568,7 @@ class DocumentProcessor:
             logger.warning("%d chunks failed to generate embeddings", failed_embeddings)
 
 
-def _docling_worker_process(file_path: str, conn) -> None:
+def _docling_worker_process(file_path: str, conn: Connection) -> None:
     """Worker process entrypoint for Docling processing.
 
     Args:
@@ -621,7 +624,7 @@ def _docling_worker_process(file_path: str, conn) -> None:
             conn.close()
 
 
-def _collect_chunk_pages(dl_chunk) -> List[int]:
+def _collect_chunk_pages(dl_chunk: object) -> List[int]:
     """Collect 1-based page numbers from a docling chunk.
 
     Args:
