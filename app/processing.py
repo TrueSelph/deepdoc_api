@@ -5,10 +5,14 @@ import logging
 import multiprocessing as mp
 import os
 import re
+import shutil
+import subprocess
 import sys
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from multiprocessing.connection import Connection
-from typing import Any, Dict, List, Optional, Set
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Union
 
 from app.embeddings import embedding_client
 from app.models import ChunkMetadata, ChunkResult
@@ -16,14 +20,366 @@ from app.models import ChunkMetadata, ChunkResult
 logger = logging.getLogger(__name__)
 
 # Reduce thread contention that can contribute to stalls with some backends
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.update(
+    {"OMP_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"}
+)
 
 # Set environment variables to prevent MPS fork issues on macOS
 if sys.platform == "darwin":
-    os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
-    os.environ.setdefault("PYTORCH_MPS_DISABLE", "1")
+    os.environ.update({"PYTORCH_ENABLE_MPS_FALLBACK": "1", "PYTORCH_MPS_DISABLE": "1"})
+
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+HTML_EXTS = {".html", ".htm", ".xhtml"}
+TEXT_EXTS = {".txt", ".md", ".rst", ".log", ".xml"}
+OFFICE_LIKE_EXTS = {
+    ".doc",
+    ".docx",
+    ".rtf",
+    ".xls",
+    ".xlsx",
+    ".csv",
+    ".ppt",
+    ".pptx",
+    ".odt",
+    ".ods",
+    ".odp",
+    ".pages",
+    ".numbers",
+    ".key",
+}
+
+
+def _which(cmd: str) -> Optional[str]:
+    """Shallow wrapper around shutil.which with typing."""
+    return shutil.which(cmd)
+
+
+def _ensure_dir(p: Union[str, Path]) -> None:
+    """Ensure parent directory of path exists."""
+    Path(p).parent.mkdir(parents=True, exist_ok=True)
+
+
+def _extract_original_filename(file_path: str, params: dict) -> str:
+    """Extract original filename from parameters, stripping UUID prefix if present.
+
+    Args:
+        file_path: Path to the document file
+        params: Processing parameters dictionary
+
+    Returns:
+        Original filename without job ID prefix
+    """
+    original_filenames = params.get("original_filenames", {}) or {}
+    original_filename = original_filenames.get(file_path, os.path.basename(file_path))
+
+    # Remove job ID prefix if looks like a UUID_ prefix
+    if "_" in original_filename:
+        parts = original_filename.split("_", 1)
+        if len(parts) > 1 and len(parts[0]) == 36:
+            original_filename = parts[1]
+
+    return original_filename
+
+
+class DocumentConverter:
+    """Handles document conversion to PDF for various file formats."""
+
+    def __init__(self) -> None:
+        """Initialize the document converter."""
+        self._soffice_path = _which("soffice") or _which("libreoffice")
+
+    def convert_to_pdf(self, input_path: str, output_path: str) -> bool:
+        """Convert document to PDF using appropriate method based on file extension.
+
+        Args:
+            input_path: Path to input file
+            output_path: Path to output PDF file
+
+        Returns:
+            True if conversion succeeded, False otherwise
+        """
+        file_ext = os.path.splitext(input_path)[1].lower()
+
+        # Already PDF: copy if different path
+        if file_ext == ".pdf":
+            if os.path.abspath(input_path) == os.path.abspath(output_path):
+                return True
+            _ensure_dir(output_path)
+            try:
+                shutil.copy2(input_path, output_path)
+                return True
+            except Exception as e:
+                logger.error("Failed to copy PDF: %s", e)
+                return False
+
+        # Images - Pillow
+        if file_ext in IMAGE_EXTS:
+            return self._convert_image_to_pdf(input_path, output_path)
+
+        # HTML - try pdfkit first then WeasyPrint
+        if file_ext in HTML_EXTS:
+            if self._convert_with_pdfkit(input_path, output_path):
+                return True
+            logger.warning("pdfkit failed; trying WeasyPrint for HTML.")
+            return self._convert_with_weasyprint(input_path, output_path)
+
+        # Plain text / Markdown / reST / logs / XML
+        if file_ext in TEXT_EXTS:
+            return self._convert_text_to_pdf(input_path, output_path)
+
+        # Office-like docs - LibreOffice first
+        if file_ext in OFFICE_LIKE_EXTS:
+            if self._convert_with_libreoffice(input_path, output_path):
+                return True
+            logger.warning(
+                "LibreOffice failed for %s; no secondary converter available.", file_ext
+            )
+            return False
+
+        # Unknown: try LibreOffice; if it fails, try WeasyPrint as a last resort
+        if self._convert_with_libreoffice(input_path, output_path):
+            return True
+        logger.warning("Unknown format; attempting WeasyPrint as a last resort.")
+        return self._convert_with_weasyprint(input_path, output_path)
+
+    def _convert_with_pdfkit(self, input_path: str, output_path: str) -> bool:
+        """Convert HTML to PDF using pdfkit/wkhtmltopdf."""
+        try:
+            import pdfkit  # type: ignore
+        except ImportError:
+            logger.debug("pdfkit not available.")
+            return False
+
+        _ensure_dir(output_path)
+        try:
+            # Allow overriding wkhtmltopdf binary via env var if needed
+            wkhtml_path = os.getenv("WKHTMLTOPDF_PATH")
+            config = (
+                pdfkit.configuration(wkhtmltopdf=wkhtml_path) if wkhtml_path else None
+            )
+            options = {
+                "quiet": "",
+                "enable-local-file-access": None,
+                "load-error-handling": "ignore",
+                "load-media-error-handling": "ignore",
+                "print-media-type": None,
+                "disable-smart-shrinking": None,
+                "margin-top": "10mm",
+                "margin-right": "10mm",
+                "margin-bottom": "10mm",
+                "margin-left": "10mm",
+            }
+            pdfkit.from_file(
+                input_path, output_path, options=options, configuration=config
+            )
+            return os.path.exists(output_path)
+        except Exception as e:
+            logger.warning("pdfkit conversion failed: %s", e)
+            return False
+
+    def _convert_with_weasyprint(self, input_path: str, output_path: str) -> bool:
+        """Convert HTML to PDF using WeasyPrint."""
+        try:
+            from weasyprint import CSS, HTML  # type: ignore
+        except ImportError:
+            logger.debug("WeasyPrint not available.")
+            return False
+
+        _ensure_dir(output_path)
+        try:
+            base_url = os.path.dirname(os.path.abspath(input_path))
+            # Minimal default CSS to avoid overly cramped output
+            default_css = CSS(
+                string="""
+                @page { size: A4; margin: 10mm; }
+                body { font-family: sans-serif; font-size: 12px; }
+                pre { white-space: pre-wrap; word-wrap: break-word; }
+                img { max-width: 100%; }
+            """
+            )
+            HTML(filename=input_path, base_url=base_url).write_pdf(
+                output_path, stylesheets=[default_css]
+            )
+            return os.path.exists(output_path)
+        except Exception as e:
+            logger.warning("WeasyPrint conversion failed: %s", e)
+            return False
+
+    def _convert_text_to_pdf(self, input_path: str, output_path: str) -> bool:
+        """Convert plaintext/Markdown/reST/XML to PDF via HTML rendering."""
+        try:
+            with open(input_path, "r", encoding="utf-8", errors="ignore") as f:
+                raw = f.read()
+        except Exception as e:
+            logger.error("Failed reading text file: %s", e)
+            return False
+
+        ext = os.path.splitext(input_path)[1].lower()
+        html_body: str
+
+        # Try Markdown
+        if ext == ".md":
+            try:
+                import markdown  # type: ignore
+
+                html_body = markdown.markdown(
+                    raw, extensions=["extra", "tables", "sane_lists", "toc"]
+                )
+            except Exception as e:
+                logger.debug(
+                    "Markdown conversion failed (%s); falling back to <pre>.", e
+                )
+                html_body = f"<pre>{raw}</pre>"
+
+        # Try reStructuredText
+        elif ext == ".rst":
+            try:
+                from docutils.core import publish_parts  # type: ignore
+
+                parts = publish_parts(source=raw, writer_name="html5")
+                html_body = parts.get("html_body", "") or f"<pre>{raw}</pre>"
+            except Exception as e:
+                logger.debug("reST conversion failed (%s); falling back to <pre>.", e)
+                html_body = f"<pre>{raw}</pre>"
+        else:
+            # Plain text, logs, xml
+            if ext == ".xml":
+                html_body = raw
+            else:
+                html_body = f"<pre>{raw}</pre>"
+
+        html_doc = f"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>{os.path.basename(input_path)}</title>
+<style>
+body {{ font-family: sans-serif; font-size: 12px; }}
+pre {{ white-space: pre-wrap; word-wrap: break-word; }}
+code {{ white-space: pre-wrap; }}
+</style>
+</head>
+<body>
+{html_body}
+</body>
+</html>
+"""
+        # Write to a temp HTML next to output and convert
+        tmp_html = Path(output_path).with_suffix(".tmp.html")
+        try:
+            tmp_html.write_text(html_doc, encoding="utf-8")
+        except Exception as e:
+            logger.error("Failed writing temp HTML: %s", e)
+            return False
+
+        try:
+            # Prefer WeasyPrint for internal, fallback to pdfkit
+            if self._convert_with_weasyprint(str(tmp_html), output_path):
+                return True
+            logger.warning(
+                "WeasyPrint failed; trying pdfkit for text-based conversion."
+            )
+            return self._convert_with_pdfkit(str(tmp_html), output_path)
+        finally:
+            with contextlib.suppress(Exception):
+                tmp_html.unlink()
+
+    def _convert_with_libreoffice(self, input_path: str, output_path: str) -> bool:
+        """Convert Office-like documents to PDF via headless LibreOffice."""
+        if not self._soffice_path:
+            logger.debug("LibreOffice (soffice) not found in PATH.")
+            return False
+
+        in_path = Path(input_path).resolve()
+        out_path = Path(output_path).resolve()
+        _ensure_dir(out_path)
+
+        # LibreOffice writes to --outdir with same stem + .pdf
+        tmp_outdir = out_path.parent / f".lo_{in_path.stem}"
+        tmp_outdir.mkdir(parents=True, exist_ok=True)
+
+        cmd = [
+            self._soffice_path,
+            "--headless",
+            "--nologo",
+            "--nofirststartwizard",
+            "--convert-to",
+            "pdf",
+            "--outdir",
+            str(tmp_outdir),
+            str(in_path),
+        ]
+        try:
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=300,
+            )
+            candidate = tmp_outdir / (in_path.stem + ".pdf")
+            if proc.returncode != 0 or not candidate.exists():
+                logger.warning(
+                    "LibreOffice conversion failed. rc=%s, stderr=%s",
+                    proc.returncode,
+                    proc.stderr,
+                )
+                return False
+            # Move to desired output path
+            if out_path.exists():
+                with contextlib.suppress(Exception):
+                    out_path.unlink()
+            candidate.replace(out_path)
+            return True
+        except Exception:
+            logger.exception("LibreOffice conversion error")
+            return False
+        finally:
+            # Best-effort cleanup
+            with contextlib.suppress(Exception):
+                for p in tmp_outdir.iterdir():
+                    with contextlib.suppress(Exception):
+                        p.unlink()
+                tmp_outdir.rmdir()
+
+    def _convert_image_to_pdf(self, input_path: str, output_path: str) -> bool:
+        """Convert image (including multi-frame TIFF) to PDF via Pillow."""
+        try:
+            from PIL import Image  # type: ignore
+        except ImportError:
+            logger.debug("Pillow not installed.")
+            return False
+
+        in_path = Path(input_path).resolve()
+        out_path = Path(output_path).resolve()
+        _ensure_dir(out_path)
+
+        try:
+            with Image.open(in_path) as im:
+                frames = []
+                try:
+                    i = 0
+                    while True:
+                        im.seek(i)
+                        frames.append(im.convert("RGB"))
+                        i += 1
+                except EOFError:
+                    pass
+
+                if len(frames) == 1:
+                    frames[0].save(out_path, "PDF", resolution=300.0)
+                else:
+                    frames[0].save(
+                        out_path,
+                        "PDF",
+                        save_all=True,
+                        append_images=frames[1:],
+                        resolution=300.0,
+                    )
+            return out_path.exists()
+        except Exception:
+            logger.exception("Image to PDF failed")
+            return False
 
 
 class DocumentProcessor:
@@ -43,6 +399,7 @@ class DocumentProcessor:
         ]
         # Thread pool for embedding generation
         self.embedding_executor = ThreadPoolExecutor(max_workers=3)
+        self.document_converter = DocumentConverter()
 
     def process_document(self, file_path: str, params: dict) -> List[ChunkResult]:
         """Process a single document using Docling's DocumentConverter and HybridChunker.
@@ -54,25 +411,9 @@ class DocumentProcessor:
         Returns:
             List of processed chunks with metadata
         """
-        original_filename = self._resolve_original_filename(file_path, params)
+        original_filename = _extract_original_filename(file_path, params)
 
-        # On macOS, use a direct approach to avoid fork issues with MPS
-        if sys.platform == "darwin":
-            logger.info("Using direct processing on macOS to avoid MPS fork issues")
-            try:
-                return self._process_directly(file_path, original_filename, params)
-            except Exception as e:
-                logger.error(
-                    "Direct processing failed for %s: %s. Falling back.",
-                    file_path,
-                    e,
-                )
-                fallback_processor = FallbackDocumentProcessor()
-                return fallback_processor.process_document(
-                    file_path, params, original_filename
-                )
-
-        # On other platforms, use the multiprocessing approach with timeout
+        # use the multiprocessing approach with timeout
         timeout_seconds = max(10, int(params.get("timeout_seconds", 180)))
 
         try:
@@ -99,18 +440,20 @@ class DocumentProcessor:
                 file_path, params, original_filename
             )
 
-    def _process_directly(
-        self, file_path: str, original_filename: str, params: dict
-    ) -> List[ChunkResult]:
-        """Process document directly without multiprocessing (for macOS).
+    def _process_with_docling(self, file_path: str) -> List[Dict[str, Any]]:
+        """Common function to process document using Docling with PDF conversion.
+
+        This function ensures documents are converted to PDF format before processing.
 
         Args:
             file_path: Path to the document file
-            original_filename: Original filename without job ID prefix
-            params: Processing parameters dictionary
 
         Returns:
-            List of processed chunks with metadata
+            List of chunk data dictionaries with text, pages, and optional bbox
+
+        Raises:
+            ImportError: If required Docling components not available
+            RuntimeError: If document conversion or processing fails
         """
         try:
             from docling.chunking import HybridChunker
@@ -118,52 +461,92 @@ class DocumentProcessor:
         except ImportError as e:
             raise ImportError(f"Required Docling components not available: {e}")
 
-        # Convert the document
-        converter = DocumentConverter()
-        result = converter.convert(source=file_path)
-        doc = result.document
+        # Get upload directory and create temp subfolder
+        upload_dir = os.getenv("UPLOAD_DIR", "./uploads")
+        temp_dir = os.path.join(upload_dir, "temp")
+        os.makedirs(temp_dir, exist_ok=True)
 
-        # Create chunker and generate chunks
-        chunker = HybridChunker()
-        chunk_iter = chunker.chunk(dl_doc=doc)
+        temp_pdf_path: Optional[str] = None
 
-        chunks = []
-        for _i, chunk in enumerate(chunk_iter):
-            # Use contextualized text for better results
-            enriched_text = chunker.contextualize(chunk=chunk)
-            text = (enriched_text or "").strip()
+        try:
+            # First, detect the input format
+            file_ext = os.path.splitext(file_path)[1].lower()
+            is_pdf = file_ext == ".pdf"
 
-            if not text:
-                # Fallback to regular text if contextualization returns empty
-                text = (chunk.text or "").strip()
+            # Convert non-PDF files to PDF before processing
+            if not is_pdf:
+                # Create temporary PDF file in the temp subfolder
+                temp_filename = f"converted_{uuid.uuid4().hex}.pdf"
+                temp_pdf_path = os.path.join(temp_dir, temp_filename)
+
+                conversion_success = self.document_converter.convert_to_pdf(
+                    file_path, temp_pdf_path
+                )
+
+                if conversion_success:
+                    processing_file_path = temp_pdf_path
+                else:
+                    # If conversion fails, try to process the original file directly
+                    logger.warning(
+                        "PDF conversion failed for %s, attempting direct processing",
+                        file_path,
+                    )
+                    processing_file_path = file_path
+
+                original_format = file_ext
+
+            else:
+                # File is already PDF, use directly
+                processing_file_path = file_path
+                original_format = ".pdf"
+
+            # Process the document with Docling
+            converter = DocumentConverter()
+            result = converter.convert(source=processing_file_path)
+            doc = result.document
+
+            # Create chunker and generate chunks
+            chunker = HybridChunker()
+            chunk_iter = chunker.chunk(dl_doc=doc)
+
+            chunks_data: List[Dict[str, Any]] = []
+
+            for chunk in chunk_iter:
+                # Use contextualized text for better results
+                enriched_text = chunker.contextualize(chunk=chunk)
+                text = (enriched_text or "").strip()
+
                 if not text:
-                    continue
+                    # Fallback to regular text if contextualization returns empty
+                    text = (chunk.text or "").strip()
+                    if not text:
+                        continue
 
-            # Extract page information
-            pages = self._collect_chunk_pages(chunk)
+                # Extract page information
+                pages = self._collect_chunk_pages(chunk)
 
-            # Extract bounding box data
-            bbox_data = self._collect_bounding_box(chunk)
+                # Extract bounding box data
+                bbox_data = self._collect_bounding_box(chunk)
 
-            chunk_id = f"chunk_{os.urandom(8).hex()}"
-            metadata = ChunkMetadata(
-                page_num_int=pages,
-                original_filename=original_filename,
-                chunk_size=len(text),
-                chunk_overlap=0,
-            )
+                chunk_data = {
+                    "text": text,
+                    "pages": pages,
+                    "bbox": bbox_data,
+                    "original_format": original_format,
+                }
+                chunks_data.append(chunk_data)
 
-            # Add bounding box to metadata if available
-            if bbox_data:
-                metadata.bbox = bbox_data
+            return chunks_data
 
-            chunks.append(ChunkResult(id=chunk_id, metadata=metadata, text=text))
+        except Exception as e:
+            logger.error("Failed to process document %s: %s", file_path, e)
+            raise RuntimeError(f"Document processing failed: {e}")
 
-        # Generate embeddings if requested
-        if params.get("with_embeddings", False) and chunks:
-            self._attach_embeddings(chunks)
-
-        return chunks
+        finally:
+            # Clean up temporary PDF file if it was created
+            if temp_pdf_path and os.path.exists(temp_pdf_path):
+                with contextlib.suppress(OSError):
+                    os.unlink(temp_pdf_path)
 
     def _collect_chunk_pages(self, dl_chunk: object) -> List[int]:
         """Collect 1-based page numbers from a docling chunk.
@@ -280,7 +663,7 @@ class DocumentProcessor:
         Returns:
             Dictionary with bounding box coordinates or None if not available
         """
-        bbox_data = None
+        bbox_data: Optional[Dict[str, float]] = None
 
         # First, try to extract from metadata provenance (most reliable)
         meta = getattr(dl_chunk, "metadata", None) or getattr(dl_chunk, "meta", None)
@@ -481,13 +864,19 @@ class DocumentProcessor:
             text = (ch.get("text") or "").strip()
             if not text:
                 continue
-            # Collect chunk pages
-            pages = self._collect_chunk_pages(ch)
-            # Extract bounding box data
-            bbox_data = self._collect_bounding_box(ch)
-            chunk_id = f"chunk_{os.urandom(8).hex()}"
+            # Prefer pages from worker output; otherwise try to re-collect
+            pages = (
+                ch.get("pages")
+                if isinstance(ch, dict)
+                else self._collect_chunk_pages(ch)
+            )
+            # Extract bounding box data (not available from worker; remains None)
+            bbox_data = (
+                self._collect_bounding_box(ch) if not isinstance(ch, dict) else None
+            )
+            chunk_id = f"chunk_{uuid.uuid4().hex}"
             meta = ChunkMetadata(
-                page_num_int=pages,
+                page_num_int=pages or [1],
                 original_filename=original_filename,
                 chunk_size=len(text),
                 chunk_overlap=0,
@@ -499,28 +888,6 @@ class DocumentProcessor:
             chunks.append(ChunkResult(id=chunk_id, metadata=meta, text=text))
 
         return chunks
-
-    def _resolve_original_filename(self, file_path: str, params: dict) -> str:
-        """Resolve original filename from params; strip UUID prefix if present.
-
-        Args:
-            file_path: Path to the document file
-            params: Processing parameters dictionary
-
-        Returns:
-            Original filename without job ID prefix
-        """
-        original_filenames = params.get("original_filenames", {}) or {}
-        original_filename = original_filenames.get(
-            file_path, os.path.basename(file_path)
-        )
-
-        # Remove job ID prefix if looks like a UUID_ prefix
-        if original_filename and "_" in original_filename:
-            parts = original_filename.split("_", 1)
-            if len(parts) > 1 and len(parts[0]) == 36:
-                original_filename = parts[1]
-        return original_filename
 
     def _attach_embeddings(self, chunks: List[ChunkResult]) -> None:
         """Generate embeddings for chunks one at a time to handle large documents.
@@ -577,43 +944,25 @@ def _docling_worker_process(file_path: str, conn: Connection) -> None:
     """
     # Set environment variables to prevent MPS issues
     if sys.platform == "darwin":
-        os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
-        os.environ.setdefault("PYTORCH_MPS_DISABLE", "1")
+        os.environ.update(
+            {"PYTORCH_ENABLE_MPS_FALLBACK": "1", "PYTORCH_MPS_DISABLE": "1"}
+        )
 
     try:
-        # Try to import the required components
-        try:
-            from docling.chunking import HybridChunker
-            from docling.document_converter import DocumentConverter
-        except ImportError as e:
-            raise ImportError(f"Required Docling components not available: {e}")
+        # Create processor instance to use the common processing function
+        processor = DocumentProcessor()
+        chunks_data = processor._process_with_docling(file_path)
 
-        # Convert the document
-        converter = DocumentConverter()
-        result = converter.convert(source=file_path)
-        doc = result.document
-
-        # Create chunker and generate chunks
-        chunker = HybridChunker()
-        chunk_iter = chunker.chunk(dl_doc=doc)
-
+        # Prepare output for pipe communication
         out_chunks: List[Dict[str, Any]] = []
-
-        for i, chunk in enumerate(chunk_iter):
-            # Use contextualized text for better results
-            enriched_text = chunker.contextualize(chunk=chunk)
-            text = (enriched_text or "").strip()
-
-            if not text:
-                # Fallback to regular text if contextualization returns empty
-                text = (chunk.text or "").strip()
-                if not text:
-                    continue
-
-            # Extract page information
-            pages = _collect_chunk_pages(chunk)
-
-            out_chunks.append({"text": text, "pages": pages, "chunk_index": i})
+        for i, chunk_data in enumerate(chunks_data):
+            out_chunks.append(
+                {
+                    "text": chunk_data["text"],
+                    "pages": chunk_data["pages"],
+                    "chunk_index": i,
+                }
+            )
 
         conn.send({"ok": True, "chunks": out_chunks})
         conn.close()
@@ -622,69 +971,6 @@ def _docling_worker_process(file_path: str, conn: Connection) -> None:
         with contextlib.suppress(Exception):
             conn.send({"ok": False, "error": f"{type(e).__name__}: {e}"})
             conn.close()
-
-
-def _collect_chunk_pages(dl_chunk: object) -> List[int]:
-    """Collect 1-based page numbers from a docling chunk.
-
-    Args:
-        dl_chunk: Docling chunk object
-
-    Returns:
-        Sorted list of page numbers
-    """
-    pages: Set[int] = set()
-
-    # Try different attributes that might contain page information
-    for attr in ("pages", "page_numbers", "page_nums"):
-        val = getattr(dl_chunk, attr, None)
-        if val:
-            with contextlib.suppress(Exception):
-                if isinstance(val, (list, tuple, set)):
-                    for p in val:
-                        try:
-                            p_int = int(p)
-                            pages.add(p_int if p_int >= 1 else p_int + 1)
-                        except (ValueError, TypeError):
-                            pass
-                elif isinstance(val, int):
-                    pages.add(val if val >= 1 else val + 1)
-
-    # Check for source_spans or spans with page indices
-    spans = getattr(dl_chunk, "source_spans", None) or getattr(dl_chunk, "spans", None)
-    if spans:
-        for sp in spans:
-            for attr in ("page", "page_idx", "page_number", "page_num"):
-                page_idx = getattr(sp, attr, None)
-                if page_idx is not None:
-                    try:
-                        p_int = int(page_idx)
-                        pages.add(p_int + 1)  # assume 0-based in spans
-                        break
-                    except (ValueError, TypeError):
-                        pass
-
-    # Check metadata for page information
-    meta = getattr(dl_chunk, "metadata", None) or getattr(dl_chunk, "meta", None)
-    if meta is not None:
-        for attr in ("pages", "page_numbers", "page_nums"):
-            meta_pages = getattr(meta, attr, None)
-            if meta_pages:
-                with contextlib.suppress(Exception):
-                    if isinstance(meta_pages, (list, tuple, set)):
-                        for p in meta_pages:
-                            try:
-                                p_int = int(p)
-                                pages.add(p_int if p_int >= 1 else p_int + 1)
-                            except (ValueError, TypeError):
-                                pass
-                    elif isinstance(meta_pages, int):
-                        pages.add(meta_pages if meta_pages >= 1 else meta_pages + 1)
-
-    if not pages:
-        pages = {1}
-
-    return sorted(pages)
 
 
 class FallbackDocumentProcessor:
@@ -718,11 +1004,7 @@ class FallbackDocumentProcessor:
         """
         try:
             if original_filename is None:
-                original_filename = os.path.basename(file_path)
-                if "_" in original_filename:
-                    parts = original_filename.split("_", 1)
-                    if len(parts) > 1 and len(parts[0]) == 36:
-                        original_filename = parts[1]
+                original_filename = _extract_original_filename(file_path, params)
 
             file_ext = os.path.splitext(file_path)[1].lower()
             content = ""
@@ -751,7 +1033,7 @@ class FallbackDocumentProcessor:
             logger.error("Fallback processing failed for %s: %s", file_path, e)
             return [
                 ChunkResult(
-                    id=f"chunk_{os.urandom(8).hex()}",
+                    id=f"chunk_{uuid.uuid4().hex}",
                     metadata=ChunkMetadata(
                         page_num_int=[1],
                         original_filename=original_filename
@@ -791,7 +1073,7 @@ class FallbackDocumentProcessor:
             Extracted text content
         """
         try:
-            import PyPDF2
+            import PyPDF2  # type: ignore
 
             text = ""
             with open(file_path, "rb") as file:
@@ -813,7 +1095,7 @@ class FallbackDocumentProcessor:
             Extracted text content
         """
         try:
-            import docx
+            import docx  # type: ignore
 
             doc = docx.Document(file_path)
             text = "\n".join([paragraph.text for paragraph in doc.paragraphs])
@@ -834,8 +1116,8 @@ class FallbackDocumentProcessor:
             Extracted text content
         """
         try:
-            import pytesseract
-            from PIL import Image
+            import pytesseract  # type: ignore
+            from PIL import Image  # type: ignore
 
             image = Image.open(file_path)
             text = pytesseract.image_to_string(image)
@@ -869,13 +1151,11 @@ class FallbackDocumentProcessor:
         Returns:
             List of chunks with metadata
         """
-        chunks = []
+        chunks: List[ChunkResult] = []
         start = 0
-        chunk_count = 0
         n = len(content or "")
 
         while start < n:
-            chunk_count += 1
             end = min(start + chunk_size, n)
 
             if end < n:
@@ -885,7 +1165,7 @@ class FallbackDocumentProcessor:
 
             chunk_text = content[start:end].strip()
             if chunk_text:
-                chunk_id = f"chunk_{os.urandom(8).hex()}"
+                chunk_id = f"chunk_{uuid.uuid4().hex}"
                 metadata = ChunkMetadata(
                     page_num_int=page_info.get("pages", [1]),
                     original_filename=original_filename,

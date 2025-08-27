@@ -156,7 +156,7 @@ Processed chunks are returned in the following format:
         "chunk_overlap": 100
       },
       "text": "Chunk content text...",
-      "embedding": [0.1, 0.2, 0.3, ...]  // if with_embeddings=true
+      "embeddings": [0.1, 0.2, 0.3, ...]  // if with_embeddings=true
     }
   ],
   "error": null

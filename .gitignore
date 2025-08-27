@@ -10,4 +10,7 @@ processed/
 *.pyc
 __pycache__
 venv
+.venv
 .pytest_cache
+# Common
+.DS_Store
