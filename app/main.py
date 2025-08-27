@@ -17,6 +17,7 @@ from urllib.parse import unquote, urlparse
 import aiofiles  # type: ignore
 import requests
 from fastapi import BackgroundTasks, FastAPI, HTTPException, UploadFile
+from fastapi.params import Body
 
 from app.config import settings
 from app.models import (
@@ -398,12 +399,12 @@ async def _retry_callback_with_simple_payload(
 async def upload_and_chunk_endpoint(
     background_tasks: BackgroundTasks,
     files: List[UploadFile] | None = None,
-    urls: List[str] | None = None,
-    from_page: int = 0,
-    to_page: int = 100000,
-    lang: str = "english",
-    with_embeddings: bool = False,
-    callback_url: str | None = None,
+    urls: List[str] | None = Body(None),  # noqa: B008
+    from_page: int = Body(0),  # noqa: B008
+    to_page: int = Body(100000),  # noqa: B008
+    lang: str = Body("english"),  # noqa: B008
+    with_embeddings: bool = Body(False),  # noqa: B008
+    callback_url: str | None = Body(None),  # noqa: B008
 ) -> Dict[str, str]:
     """Endpoint to process files asynchronously from uploads or URLs"""
     # Generate job ID

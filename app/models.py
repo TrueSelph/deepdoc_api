@@ -41,15 +41,3 @@ class JobStatusResponse(BaseModel):
     status: JobStatus
     result: Optional[List[ChunkResult]] = None
     error: Optional[str] = None
-
-
-class UploadChunkRequest(BaseModel):
-    """Request parameters for uploading and chunking documents."""
-
-    agent_id: Optional[str] = None
-    from_page: int = 0
-    to_page: int = 100000
-    lang: str = "english"
-    with_embeddings: bool = False
-    urls: Optional[List[str]] = None
-    metadatas: Optional[List[dict]] = None
