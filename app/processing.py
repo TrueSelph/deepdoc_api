@@ -414,7 +414,7 @@ class DocumentProcessor:
         original_filename = _extract_original_filename(file_path, params)
 
         # use the multiprocessing approach with timeout
-        timeout_seconds = max(10, int(params.get("timeout_seconds", 180)))
+        timeout_seconds = max(10, int(params.get("timeout_seconds", 360)))
 
         try:
             chunks = self._run_docling_with_timeout(
