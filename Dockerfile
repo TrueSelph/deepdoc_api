@@ -51,16 +51,13 @@ ENV OPENBLAS_NUM_THREADS=1
 ENV MKL_NUM_THREADS=1
 ENV TOKENIZERS_PARALLELISM=false
 
-# Expose port
-EXPOSE 8991
+# Expose ports
+EXPOSE 8991 5555
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
 	CMD curl -f http://localhost:8991/health || exit 1
 
-# Run as non-root user for security
+# Run as non-root user for security (except when running Celery as root is forced)
 RUN useradd -m appuser && chown -R appuser:appuser /app
 USER appuser
-
-# Run the application
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8991", "--workers", "2"]

@@ -9,6 +9,7 @@ python-dotenv
 aiofiles
 redis
 celery
+flower
 
 # Add these for fallback document processing
 PyPDF2

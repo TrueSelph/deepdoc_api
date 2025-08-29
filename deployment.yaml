@@ -1,0 +1,166 @@
+# API Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deepdoc-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: deepdoc-api
+  template:
+    metadata:
+      labels:
+        app: deepdoc-api
+    spec:
+      containers:
+        - name: deepdoc-api
+          image: registry.v75inc.dev/deepdoc_api/api:latest
+          ports:
+            - containerPort: 8991
+          env:
+            - name: EMBEDDING_SERVICE_URL
+              value: "https://embeddings.trueselph.com/openai/v1"
+            - name: EMBEDDING_SERVICE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: deepdoc-secret
+                  key: EMBEDDING_SERVICE_API_KEY
+            - name: UPLOAD_DIR
+              value: "./uploads"
+            - name: PROCESSED_DIR
+              value: "./processed"
+            - name: MAX_FILE_SIZE
+              value: "52428800"
+            - name: EMBEDDING_MODEL
+              value: "intfloat/multilingual-e5-large-instruct"
+            - name: REDIS_HOST
+              value: ""
+            - name: REDIS_PORT
+              value: "6379"
+            - name: MAX_PAGES_PER_BATCH
+              value: "20"
+            - name: EMPTY_BATCH_THRESHOLD
+              value: "2"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8991
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8991
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 1
+              memory: 2Gi
+            limits:
+              cpu: 2
+              memory: 6Gi
+---
+# API Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: deepdoc-api
+spec:
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8991
+    - name: https
+      port: 443
+      targetPort: 8991
+  selector:
+    app: deepdoc-api
+  type: ClusterIP
+---
+# API Ingress
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: deepdoc-api
+  annotations:
+    alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:us-east-2:682833334575:certificate/f2bd1517-b01c-4fcc-9535-d5843a1339c1
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS":443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    external-dns.alpha.kubernetes.io/hostname: deepdoc-api.trueselph.com
+spec:
+  ingressClassName: alb
+  rules:
+    - host: deepdoc-api.trueselph.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: deepdoc-api
+                port:
+                  number: 80
+---
+# Redis StatefulSet
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+spec:
+  serviceName: "redis-headless"
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: redis-secret
+                  key: REDIS_PASSWORD
+          ports:
+            - containerPort: 6379
+          volumeMounts:
+            - name: redis-persistent-storage
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: redis-persistent-storage
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: gp2
+        resources:
+          requests:
+            storage: 10Gi
+---
+# PostgreSQL Headless Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-headless
+  labels:
+    app: redis
+spec:
+  ports:
+    - port: 6379
+  clusterIP: None
+  selector:
+    app: redis
+---
+

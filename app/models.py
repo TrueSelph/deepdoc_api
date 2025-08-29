@@ -38,6 +38,8 @@ class ChunkResult(BaseModel):
 class JobStatusResponse(BaseModel):
     """Response containing job status and results."""
 
+    job_id: str
     status: JobStatus
     result: Optional[List[ChunkResult]] = None
     error: Optional[str] = None
+    created_at: str

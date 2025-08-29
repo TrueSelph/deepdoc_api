@@ -27,6 +27,7 @@ from app.models import (
     JobStatusResponse,
 )
 from app.processing import document_processor
+from app.tasks import jobs, process_document_task, trigger_callback_task
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -53,7 +54,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
     os.makedirs(settings.PROCESSED_DIR, exist_ok=True)
 
-    # Initialize thread pool executor
+    # Initialize thread pool executor for non-Celery tasks
     executor = ThreadPoolExecutor(max_workers=4)
     logger.info(
         f"Thread pool executor initialized with {executor._max_workers} workers"
@@ -66,15 +67,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # Shutdown logic
     logger.info("Shutting down application...")
-
-    # Cancel all ongoing jobs
-    for job_id in list(jobs.keys()):
-        if jobs[job_id]["status"] == JobStatus.PROCESSING:
-            logger.info(f"Cancelling job {job_id} during shutdown")
-            if job_id in cancellation_events:
-                cancellation_events[job_id].set()
-            jobs[job_id]["status"] = JobStatus.CANCELLED
-            jobs[job_id]["error"] = "Job was cancelled during server shutdown"
 
     # Shutdown thread pool executor
     if executor:
@@ -397,7 +389,6 @@ async def _retry_callback_with_simple_payload(
 
 @app.post("/upload_and_chunk")
 async def upload_and_chunk_endpoint(
-    background_tasks: BackgroundTasks,
     files: List[UploadFile] | None = None,
     urls: List[str] | None = Body(None),  # noqa: B008
     from_page: int = Body(0),  # noqa: B008
@@ -470,120 +461,75 @@ async def upload_and_chunk_endpoint(
     # Initialize job status
     jobs[job_id] = {"status": JobStatus.PENDING, "result": None, "error": None}
 
-    # Start background processing and track the task
-    task = background_tasks.add_task(process_job, job_id, file_paths, params)
-    processing_tasks[job_id] = task
+    # Start Celery task for document processing
+    task = process_document_task.delay(job_id, file_paths, params)
+
+    # Store task ID for potential revocation
+    jobs[job_id]["task_id"] = task.id
+
+    # If callback is provided, set up a callback task that will run after processing
+    if callback_url:
+        # Chain the callback task to run after processing completes
+        process_document_task.apply_async(
+            args=[job_id, file_paths, params],
+            link=trigger_callback_task.si(job_id, callback_url),
+        )
+    else:
+        # Just run the processing task without a callback
+        process_document_task.delay(job_id, file_paths, params)
 
     return {"job_id": job_id}
 
 
 @app.get("/job/{job_id}")
 async def get_job_status_endpoint(job_id: str) -> JobStatusResponse:
-    """Endpoint to check the status of a job"""
-    job = jobs.get(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+    """Endpoint to get the status of a job"""
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
 
-    # Convert the stored result back to ChunkResult objects if needed
-    result = job.get("result")
-    if (
-        result
-        and isinstance(result, list)
-        and len(result) > 0
-        and isinstance(result[0], dict)
-    ):
-        # Convert dicts back to ChunkResult objects for proper serialization
-        chunk_results = []
-        for chunk_data in result:
-            if isinstance(chunk_data, dict):
-                # Handle both old and new format during transition
-                if "metadata" in chunk_data and isinstance(
-                    chunk_data["metadata"], dict
-                ):
-                    # New format with metadata object
-                    chunk_results.append(ChunkResult(**chunk_data))
-                else:
-                    # Old format - convert to new format
-                    chunk_id = chunk_data.get("id", f"chunk_{uuid.uuid4().hex}")
-                    metadata = ChunkMetadata(
-                        page_num_int=[1],  # Default page
-                        original_filename=chunk_data.get("metadata", {}).get(
-                            "original_filename", "unknown"
-                        ),
-                        chunk_size=chunk_data.get("metadata", {}).get("chunk_size"),
-                        chunk_overlap=chunk_data.get("metadata", {}).get(
-                            "chunk_overlap"
-                        ),
-                    )
-                    chunk_results.append(
-                        ChunkResult(
-                            id=chunk_id,
-                            metadata=metadata,
-                            text=chunk_data.get("text", ""),
-                            embedding=chunk_data.get("embedding"),
-                        )
-                    )
-        job["result"] = chunk_results
+    job_data = jobs[job_id]
 
-    # Ensure error is never null - convert to empty string if None
-    error = job.get("error")
-    if error is None:
-        error = ""
-
-    return JobStatusResponse(status=job["status"], result=job["result"], error=error)
+    # Convert job data to JobStatusResponse
+    return JobStatusResponse(
+        job_id=job_id,
+        status=job_data["status"],
+        result=job_data.get("result"),
+        error=job_data.get("error", ""),
+        created_at=job_data.get("created_at", datetime.datetime.now().isoformat()),
+    )
 
 
 # Add the cancel endpoint
 @app.post("/job/{job_id}/cancel")
-async def cancel_job(job_id: str) -> Dict[str, object]:
-    """Cancel a job - always returns success even if job doesn't exist or can't be cancelled"""
-    # Check if job exists
+async def cancel_job(job_id: str) -> Dict[str, str]:
+    """Endpoint to cancel a job"""
     if job_id not in jobs:
-        # Job doesn't exist, but still return success
-        logger.warning(f"Cancel requested for non-existent job: {job_id}")
-        return {
-            "status": "cancelled",
-            "message": f"Job {job_id} does not exist or was already completed",
-            "job_id": job_id,
-        }
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
 
-    job = jobs[job_id]
+    job_data = jobs[job_id]
 
-    # Check if job can be cancelled
-    if job["status"] in [JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED]:
-        # Job is already in a terminal state, but still return success
-        logger.info(
-            f"Cancel requested for job {job_id} which is already in {job['status']} state"
-        )
-        return {
-            "status": "cancelled",
-            "message": f"Job {job_id} was already in {job['status']} state",
-            "job_id": job_id,
-            "previous_status": job["status"],
-        }
+    # Check if job is already completed, failed, or cancelled
+    if job_data["status"] in [
+        JobStatus.COMPLETED,
+        JobStatus.FAILED,
+        JobStatus.CANCELLED,
+    ]:
+        return {"status": f"Job {job_id} is already {job_data['status']}"}
 
-    # If job is processing, attempt to cancel it
-    if job["status"] == JobStatus.PROCESSING and job_id in cancellation_events:
-        cancellation_events[job_id].set()
-        logger.info(f"Cancellation requested for processing job {job_id}")
+    # Get the Celery task ID from the job data
+    task_id = job_data.get("task_id")
 
-    # If job is pending, we can just mark it as cancelled
-    elif job["status"] == JobStatus.PENDING:
-        logger.info(f"Cancellation requested for pending job {job_id}")
+    if task_id:
+        # Revoke the Celery task
+        from celery.result import AsyncResult
 
-    # Update job status to cancelled regardless of previous state
+        AsyncResult(task_id).revoke(terminate=True)
+
+    # Update job status
     jobs[job_id]["status"] = JobStatus.CANCELLED
     jobs[job_id]["error"] = "Job was cancelled by user"
 
-    # Clean up any processing files for this job
-    await cleanup_job_files(job_id)
-
-    logger.info(f"Job {job_id} marked as cancelled")
-    return {
-        "status": "cancelled",
-        "message": f"Job {job_id} has been cancelled",
-        "job_id": job_id,
-    }
+    return {"status": f"Job {job_id} has been cancelled"}
 
 
 async def cleanup_job_files(job_id: str) -> None:
