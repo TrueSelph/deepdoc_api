@@ -18,6 +18,7 @@ import aiofiles  # type: ignore
 import requests
 from fastapi import BackgroundTasks, FastAPI, HTTPException, UploadFile
 from fastapi.params import Body
+from celery.result import AsyncResult
 
 from app.config import settings
 from app.models import (
@@ -27,14 +28,14 @@ from app.models import (
     JobStatusResponse,
 )
 from app.processing import document_processor
-from app.tasks import jobs, process_document_task, trigger_callback_task
+from app.tasks import process_document_task, trigger_callback_task
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Global variables for shared resources
-jobs: dict = {}
+
 executor = None
 
 # these global variables are for job cancellation tracking
@@ -207,107 +208,38 @@ async def save_upload_file(upload_file: UploadFile, destination: str) -> str:
     return upload_file.filename  # Return the original filename, not the saved path
 
 
-async def process_job(job_id: str, file_paths: List[str], params: dict) -> None:
-    """Background task to process documents for a job with cancellation support"""
-    # Create cancellation event for this job
-    cancellation_event = threading.Event()
-    cancellation_events[job_id] = cancellation_event
-
-    try:
-        jobs[job_id] = {"status": JobStatus.PROCESSING, "result": None, "error": ""}
-
-        all_chunks = []
-        processed_files = 0
-
-        for file_path in file_paths:
-            # Check for cancellation before processing each file
-            if cancellation_event.is_set():
-                logger.info(f"Job {job_id} was cancelled during processing")
-                jobs[job_id] = {
-                    "status": JobStatus.CANCELLED,
-                    "result": None,
-                    "error": "Job was cancelled by user",
-                }
-                return
-
-            try:
-                logger.info(f"Processing file: {file_path}")
-
-                # Process document using thread pool (Docling is CPU-intensive)
-                loop = asyncio.get_event_loop()
-                chunks = await loop.run_in_executor(
-                    executor,
-                    document_processor.process_document,
-                    file_path,
-                    params,  # Pass the params which includes original_filenames
-                )
-                all_chunks.extend(chunks)
-                processed_files += 1
-
-                # Clean up processed file
-                try:
-                    os.remove(file_path)
-                    logger.debug(f"Removed processed file: {file_path}")
-                except OSError as e:
-                    logger.warning(f"Could not remove file {file_path}: {e}")
-
-            except Exception as e:
-                logger.error(f"Failed to process file {file_path}: {e}")
-                # Continue with other files even if one fails
-                continue
-
-        if processed_files == 0:
-            raise Exception("No files were successfully processed")
-
-        # Check for cancellation one final time before marking as complete
-        if cancellation_event.is_set():
-            logger.info(f"Job {job_id} was cancelled after processing")
-            jobs[job_id] = {
-                "status": JobStatus.CANCELLED,
-                "result": None,
-                "error": "Job was cancelled by user after processing",
-            }
-            return
-
-        # Update job status
-        jobs[job_id] = {
-            "status": JobStatus.COMPLETED,
-            "result": [chunk.dict() for chunk in all_chunks],
-            "error": "",  # Empty string instead of null
-        }
-
-        # Trigger callback if provided
-        if params.get("callback_url"):
-            await trigger_callback(job_id, params["callback_url"])
-
-    except Exception as e:
-        logger.error(f"Job {job_id} failed: {e}")
-        jobs[job_id] = {"status": JobStatus.FAILED, "result": None, "error": str(e)}
-
-        # Trigger callback for failure if provided
-        if params.get("callback_url"):
-            await trigger_callback(job_id, params["callback_url"])
-    finally:
-        # Clean up cancellation event
-        if job_id in cancellation_events:
-            del cancellation_events[job_id]
-        if job_id in processing_tasks:
-            del processing_tasks[job_id]
-
-
 async def trigger_callback(job_id: str, callback_url: str) -> None:
     """Send job result to callback URL with proper error handling"""
     try:
         import requests
 
-        job_data = jobs.get(job_id, {})
+        task_result = AsyncResult(job_id)
+        status = CELERY_TO_JOB_STATUS.get(task_result.status, JobStatus.FAILED)
+        result = None
+        error = None
+
+        if task_result.successful():
+            task_output = task_result.result
+            if isinstance(task_output, dict):
+                status = JobStatus(task_output.get("status", JobStatus.COMPLETED))
+                result = task_output.get("result")
+                error = task_output.get("error")
+            else:
+                status = JobStatus.COMPLETED
+                result = task_result.result
+        elif task_result.failed():
+            status = JobStatus.FAILED
+            error = str(task_result.info or task_result.result)
+        elif task_result.status == "REVOKED":
+            status = JobStatus.CANCELLED
+            error = "Job was cancelled by user"
 
         # Prepare callback payload - ensure error is always a string, not null
         payload = {
             "job_id": job_id,
-            "status": job_data.get("status"),
-            "result": job_data.get("result"),
-            "error": job_data.get("error") or "",  # Convert null to empty string
+            "status": status,
+            "result": result,
+            "error": error or "",  # Convert null to empty string
             "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
         }
 
@@ -346,7 +278,7 @@ async def trigger_callback(job_id: str, callback_url: str) -> None:
 
         # If it's a 422 error, try with a different payload structure
         if e.response.status_code == 422:
-            await _retry_callback_with_simple_payload(job_id, callback_url, job_data)
+            await _retry_callback_with_simple_payload(job_id, callback_url, payload)
     except Exception as e:
         logger.error(f"Callback failed for job {job_id}: {e}")
 
@@ -398,8 +330,8 @@ async def upload_and_chunk_endpoint(
     callback_url: str | None = Body(None),  # noqa: B008
 ) -> Dict[str, str]:
     """Endpoint to process files asynchronously from uploads or URLs"""
-    # Generate job ID
-    job_id = str(uuid.uuid4())
+    # Generate a temporary ID for file handling
+    temp_id = str(uuid.uuid4())
 
     # Validate that we have at least one file source
     if not files and not urls:
@@ -418,7 +350,7 @@ async def upload_and_chunk_endpoint(
         for url in urls:  # Directly iterate over the list
             try:
                 file_path, original_filename = await download_file_from_url(
-                    url, temp_dir, job_id
+                    url, temp_dir, temp_id
                 )
                 file_paths.append(file_path)
                 original_filenames[file_path] = original_filename
@@ -438,7 +370,7 @@ async def upload_and_chunk_endpoint(
                 )
 
             # Save uploaded file with job ID prefix for uniqueness
-            file_path = os.path.join(settings.UPLOAD_DIR, f"{job_id}_{file.filename}")
+            file_path = os.path.join(settings.UPLOAD_DIR, f"{temp_id}_{file.filename}")
             os.makedirs(os.path.dirname(file_path), exist_ok=True)
             original_filename = await save_upload_file(file, file_path)
             file_paths.append(file_path)
@@ -458,44 +390,65 @@ async def upload_and_chunk_endpoint(
         "original_filenames": original_filenames,  # Pass the filename mapping
     }
 
-    # Initialize job status
-    jobs[job_id] = {"status": JobStatus.PENDING, "result": None, "error": None}
-
     # Start Celery task for document processing
-    task = process_document_task.delay(job_id, file_paths, params)
-
-    # Store task ID for potential revocation
-    jobs[job_id]["task_id"] = task.id
-
-    # If callback is provided, set up a callback task that will run after processing
     if callback_url:
         # Chain the callback task to run after processing completes
-        process_document_task.apply_async(
-            args=[job_id, file_paths, params],
-            link=trigger_callback_task.si(job_id, callback_url),
+        task = process_document_task.apply_async(
+            args=[file_paths, params],
+            link=trigger_callback_task.s(callback_url),
         )
     else:
         # Just run the processing task without a callback
-        process_document_task.delay(job_id, file_paths, params)
+        task = process_document_task.delay(file_paths, params)
 
-    return {"job_id": job_id}
+    return {"job_id": task.id}
+
+
+# Mapping from Celery states to JobStatus
+CELERY_TO_JOB_STATUS = {
+    "PENDING": JobStatus.PENDING,
+    "STARTED": JobStatus.PROCESSING,
+    "SUCCESS": JobStatus.COMPLETED,
+    "FAILURE": JobStatus.FAILED,
+    "REVOKED": JobStatus.CANCELLED,
+    "RETRY": JobStatus.PROCESSING,
+}
 
 
 @app.get("/job/{job_id}")
 async def get_job_status_endpoint(job_id: str) -> JobStatusResponse:
-    """Endpoint to get the status of a job"""
-    if job_id not in jobs:
-        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    """Endpoint to get the status of a job from the Celery backend."""
+    task_result = AsyncResult(job_id)
+    status = CELERY_TO_JOB_STATUS.get(task_result.status, JobStatus.FAILED)
+    result = None
+    error = None
 
-    job_data = jobs[job_id]
+    if task_result.successful():
+        task_output = task_result.result
+        if isinstance(task_output, dict):
+            status = JobStatus(task_output.get("status", JobStatus.COMPLETED))
+            result = task_output.get("result")
+            error = task_output.get("error")
+        else:
+            status = JobStatus.COMPLETED
+            result = task_result.result
+    elif task_result.failed():
+        status = JobStatus.FAILED
+        error = str(task_result.info or task_result.result)
+    elif task_result.status == "REVOKED":
+        status = JobStatus.CANCELLED
+        error = "Job was cancelled by user"
 
-    # Convert job data to JobStatusResponse
     return JobStatusResponse(
         job_id=job_id,
-        status=job_data["status"],
-        result=job_data.get("result"),
-        error=job_data.get("error", ""),
-        created_at=job_data.get("created_at", datetime.datetime.now().isoformat()),
+        status=status,
+        result=result,
+        error=error,
+        created_at=(
+            task_result.date_done.isoformat()
+            if task_result.date_done
+            else datetime.datetime.now(datetime.timezone.utc).isoformat()
+        ),
     )
 
 
@@ -503,31 +456,16 @@ async def get_job_status_endpoint(job_id: str) -> JobStatusResponse:
 @app.post("/job/{job_id}/cancel")
 async def cancel_job(job_id: str) -> Dict[str, str]:
     """Endpoint to cancel a job"""
-    if job_id not in jobs:
-        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    task_result = AsyncResult(job_id)
 
-    job_data = jobs[job_id]
-
-    # Check if job is already completed, failed, or cancelled
-    if job_data["status"] in [
+    if task_result.status in [
         JobStatus.COMPLETED,
         JobStatus.FAILED,
         JobStatus.CANCELLED,
     ]:
-        return {"status": f"Job {job_id} is already {job_data['status']}"}
+        return {"status": f"Job {job_id} is already {task_result.status}"}
 
-    # Get the Celery task ID from the job data
-    task_id = job_data.get("task_id")
-
-    if task_id:
-        # Revoke the Celery task
-        from celery.result import AsyncResult
-
-        AsyncResult(task_id).revoke(terminate=True)
-
-    # Update job status
-    jobs[job_id]["status"] = JobStatus.CANCELLED
-    jobs[job_id]["error"] = "Job was cancelled by user"
+    task_result.revoke(terminate=True)
 
     return {"status": f"Job {job_id} has been cancelled"}
 
@@ -575,13 +513,6 @@ async def health_check() -> Dict[str, object]:
         "status": "healthy",
         "embedding_service": embedding_status,
         "executor": executor_status,
-        "jobs_processing": sum(
-            1 for j in jobs.values() if j["status"] == JobStatus.PROCESSING
-        ),
-        "jobs_pending": sum(
-            1 for j in jobs.values() if j["status"] == JobStatus.PENDING
-        ),
-        "total_jobs": len(jobs),
     }
 
 
