@@ -34,7 +34,7 @@ services:
     depends_on:
       - redis
     restart: unless-stopped
-    command: celery -A app.celery worker --loglevel=info
+    command: celery -A app.celery_app worker --loglevel=info
 
   redis:
     image: redis:7-alpine
@@ -52,7 +52,7 @@ services:
     depends_on:
       - redis
       - celery-worker
-    command: celery -A app.celery flower --port=5555
+    command: celery -A app.celery_app flower --port=5555
 
 volumes:
   uploads_data:
