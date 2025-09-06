@@ -1,5 +1,4 @@
 version: "3.8"
-
 services:
   docling-api:
     build: .
@@ -11,11 +10,14 @@ services:
       - EMBEDDING_SERVICE_API_KEY=${EMBEDDING_SERVICE_API_KEY}
       - UPLOAD_DIR=/app/uploads
       - PROCESSED_DIR=/app/processed
+      - UNOSERVER_HOST=unoserver
+      - UNOSERVER_PORT=2002
     volumes:
       - uploads_data:/app/uploads
       - processed_data:/app/processed
     depends_on:
       - redis
+      - unoserver
     restart: unless-stopped
     command: uvicorn app.main:app --host 0.0.0.0 --port 8991 --workers 2
 
@@ -28,13 +30,35 @@ services:
       - UPLOAD_DIR=/app/uploads
       - PROCESSED_DIR=/app/processed
       - C_FORCE_ROOT=true
+      - UNOSERVER_HOST=unoserver
+      - UNOSERVER_PORT=2002
     volumes:
       - uploads_data:/app/uploads
       - processed_data:/app/processed
     depends_on:
       - redis
+      - unoserver
     restart: unless-stopped
     command: celery -A app.celery_app worker --loglevel=info
+
+  unoserver:
+    build: .
+    environment:
+      - C_FORCE_ROOT=true
+    restart: unless-stopped
+    command: unoserver --interface 0.0.0.0 --port 2002
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import xmlrpc.client; xmlrpc.client.ServerProxy('http://localhost:2002').info()",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
 
   redis:
     image: redis:7-alpine

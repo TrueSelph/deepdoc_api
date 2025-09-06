@@ -10,6 +10,7 @@ aiofiles
 redis
 celery
 flower
+unoserver
 
 # Add these for fallback document processing
 PyPDF2

@@ -127,8 +127,13 @@ class DocumentConverter:
         if file_ext in TEXT_EXTS:
             return self._convert_text_to_pdf(input_path, output_path)
 
-        # Office-like docs - LibreOffice first
+        # Office-like docs - unoserver first
         if file_ext in OFFICE_LIKE_EXTS:
+            if self._convert_with_unoserver(input_path, output_path):
+                return True
+            logger.warning(
+                "unoserver failed for %s; falling back to LibreOffice.", file_ext
+            )
             if self._convert_with_libreoffice(input_path, output_path):
                 return True
             logger.warning(
@@ -284,6 +289,54 @@ code {{ white-space: pre-wrap; }}
             with contextlib.suppress(Exception):
                 tmp_html.unlink()
 
+    def _convert_with_unoserver(self, input_path: str, output_path: str) -> bool:
+        """Convert document to PDF using unoconvert (client for unoserver)."""
+        try:
+            # Check if unoconvert is available
+            if not shutil.which("unoconvert"):
+                logger.debug("unoconvert not available.")
+                return False
+
+            _ensure_dir(output_path)
+
+            # Get unoserver connection details from environment
+            unoserver_host = os.getenv("UNOSERVER_HOST", "localhost")
+            unoserver_port = os.getenv("UNOSERVER_PORT", "2002")
+
+            cmd = [
+                "unoconvert",
+                "--server",
+                unoserver_host,
+                "--port",
+                unoserver_port,
+                "--convert-to",
+                "pdf",
+                input_path,
+                output_path,
+            ]
+
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=300,
+            )
+
+            if proc.returncode != 0:
+                logger.warning(
+                    "unoconvert failed. rc=%s, stderr=%s",
+                    proc.returncode,
+                    proc.stderr,
+                )
+                return False
+
+            return os.path.exists(output_path)
+
+        except Exception as e:
+            logger.exception("unoconvert error: %s", e)
+            return False
+
     def _convert_with_libreoffice(self, input_path: str, output_path: str) -> bool:
         """Convert Office-like documents to PDF via headless LibreOffice."""
         if not self._soffice_path:
@@ -412,13 +465,37 @@ class DocumentProcessor:
             List of processed chunks with metadata
         """
         original_filename = _extract_original_filename(file_path, params)
+        file_ext = os.path.splitext(file_path)[1].lower()
+
+        # If the file is a .docx, convert it to PDF first
+        if file_ext == ".docx":
+            upload_dir = os.getenv("UPLOAD_DIR", "./uploads")
+            temp_dir = os.path.join(upload_dir, "temp")
+            os.makedirs(temp_dir, exist_ok=True)
+
+            temp_pdf_path = os.path.join(temp_dir, f"converted_{uuid.uuid4().hex}.pdf")
+
+            conversion_success = self.document_converter.convert_to_pdf(
+                file_path, temp_pdf_path
+            )
+
+            if conversion_success:
+                processing_file_path = temp_pdf_path
+            else:
+                logger.warning(
+                    "DOCX to PDF conversion failed for %s, attempting direct processing",
+                    file_path,
+                )
+                processing_file_path = file_path
+        else:
+            processing_file_path = file_path
 
         # use the multiprocessing approach with timeout
         timeout_seconds = max(10, int(params.get("timeout_seconds", 180)))
 
         try:
             chunks = self._run_docling_with_timeout(
-                file_path=file_path,
+                file_path=processing_file_path,
                 original_filename=original_filename,
                 timeout_seconds=timeout_seconds,
             )
@@ -545,8 +622,8 @@ class DocumentProcessor:
         finally:
             # Clean up temporary PDF file if it was created
             if temp_pdf_path and os.path.exists(temp_pdf_path):
-                with contextlib.suppress(OSError):
-                    os.unlink(temp_pdf_path)
+                # We are keeping the file for debugging purposes
+                pass
 
     def _collect_chunk_pages(self, dl_chunk: object) -> List[int]:
         """Collect 1-based page numbers from a docling chunk.
