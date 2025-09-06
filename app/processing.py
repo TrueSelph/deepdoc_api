@@ -413,7 +413,23 @@ class DocumentProcessor:
         """
         original_filename = _extract_original_filename(file_path, params)
 
-        # use the multiprocessing approach with timeout
+        # On macOS, use a direct approach to avoid fork issues with MPS
+        if sys.platform == "darwin":
+            logger.info("Using direct processing on macOS to avoid MPS fork issues")
+            try:
+                return self._process_directly(file_path, original_filename, params)
+            except Exception as e:
+                logger.error(
+                    "Direct processing failed for %s: %s. Falling back.",
+                    file_path,
+                    e,
+                )
+                fallback_processor = FallbackDocumentProcessor()
+                return fallback_processor.process_document(
+                    file_path, params, original_filename
+                )
+
+        # On other platforms, use the multiprocessing approach with timeout
         timeout_seconds = max(10, int(params.get("timeout_seconds", 180)))
 
         try:
@@ -547,6 +563,53 @@ class DocumentProcessor:
             if temp_pdf_path and os.path.exists(temp_pdf_path):
                 with contextlib.suppress(OSError):
                     os.unlink(temp_pdf_path)
+
+    def _process_directly(
+        self, file_path: str, original_filename: str, params: dict
+    ) -> List[ChunkResult]:
+        """Process document directly without multiprocessing (for macOS).
+
+        Args:
+            file_path: Path to the document file
+            original_filename: Original filename without job ID prefix
+            params: Processing parameters dictionary
+
+        Returns:
+            List of processed chunks with metadata
+        """
+        try:
+            # Use the common processing function
+            chunks_data = self._process_with_docling(file_path)
+
+            # Convert to ChunkResult objects
+            chunks: List[ChunkResult] = []
+            for chunk_data in chunks_data:
+                text = chunk_data["text"]
+                pages = chunk_data["pages"]
+                bbox_data = chunk_data.get("bbox")
+
+                chunk_id = f"chunk_{uuid.uuid4().hex}"
+                metadata = ChunkMetadata(
+                    page_num_int=pages,
+                    original_filename=original_filename,
+                    chunk_size=len(text),
+                    chunk_overlap=0,
+                )
+
+                # Add bounding box to metadata if available
+                if bbox_data:
+                    metadata.bbox = bbox_data
+
+                chunks.append(ChunkResult(id=chunk_id, metadata=metadata, text=text))
+
+            # Generate embeddings if requested
+            if params.get("with_embeddings", False) and chunks:
+                self._attach_embeddings(chunks)
+
+            return chunks
+
+        except ImportError as e:
+            raise ImportError(f"Required Docling components not available: {e}")
 
     def _collect_chunk_pages(self, dl_chunk: object) -> List[int]:
         """Collect 1-based page numbers from a docling chunk.
