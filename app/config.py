@@ -10,7 +10,7 @@ load_dotenv()
 class Settings:
     """Encapsulates settings for app"""
 
-    PROJECT_NAME: str = "Docling API Service"
+    PROJECT_NAME: str = "TrueSelph DeepDoc API Service"
     VERSION: str = "0.1.0"
 
     # API settings
@@ -30,7 +30,6 @@ class Settings:
     # File processing settings
     MAX_FILE_SIZE: int = 50 * 1024 * 1024  # 50MB
     UPLOAD_DIR: str = os.getenv("UPLOAD_DIR", "./uploads")
-    PROCESSED_DIR: str = os.getenv("PROCESSED_DIR", "./processed")
 
 
 settings = Settings()

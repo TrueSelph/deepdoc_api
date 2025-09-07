@@ -53,7 +53,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # Create necessary directories
     os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
-    os.makedirs(settings.PROCESSED_DIR, exist_ok=True)
 
     # Initialize thread pool executor for non-Celery tasks
     executor = ThreadPoolExecutor(max_workers=4)
@@ -208,8 +207,23 @@ async def save_upload_file(upload_file: UploadFile, destination: str) -> str:
     return upload_file.filename  # Return the original filename, not the saved path
 
 
-async def trigger_callback(job_id: str, callback_url: str) -> None:
-    """Send job result to callback URL with proper error handling"""
+async def purge_job_files(temp_files: List[str]) -> None:
+    """Clean up temporary files after successful job delivery"""
+    for file_path in temp_files:
+        try:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+                logger.info(f"Purged temporary file: {file_path}")
+            else:
+                logger.debug(f"Skipping non-existent file: {file_path}")
+        except Exception as e:
+            logger.error(f"Failed to purge {file_path}: {e}")
+
+async def trigger_callback(job_id: str, callback_url: str, temp_files: List[str]) -> None:
+    """Send job result to callback URL with proper error handling and cleanup"""
+    # Log files to be cleaned up for verification
+    logger.info(f"Job {job_id} temp files pending cleanup: {temp_files}")
+    """Send job result to callback URL with proper error handling and cleanup"""
     try:
         import requests
 
@@ -270,6 +284,9 @@ async def trigger_callback(job_id: str, callback_url: str) -> None:
 
         response.raise_for_status()
         logger.info(f"Callback to {callback_url} successful for job {job_id}")
+        
+        # After successful delivery (HTTP 200), purge temp files
+        await purge_job_files(temp_files)
 
     except requests.exceptions.Timeout:
         logger.error(f"Callback timeout for job {job_id} to {callback_url}")
@@ -287,6 +304,9 @@ async def trigger_callback(job_id: str, callback_url: str) -> None:
             await _retry_callback_with_simple_payload(job_id, callback_url, payload)
     except Exception as e:
         logger.error(f"Callback failed for job {job_id}: {e}")
+        # Even if callback fails, attempt to clean up temp files to prevent accumulation
+        logger.info(f"Attempting cleanup after callback failure for job {job_id}")
+        await purge_job_files(temp_files)
 
 
 async def _retry_callback_with_simple_payload(
@@ -421,12 +441,13 @@ CELERY_TO_JOB_STATUS = {
 
 
 @app.get("/job/{job_id}")
-async def get_job_status_endpoint(job_id: str) -> JobStatusResponse:
+async def get_job_status_endpoint(job_id: str, background_tasks: BackgroundTasks) -> JobStatusResponse:
     """Endpoint to get the status of a job from the Celery backend."""
     task_result = AsyncResult(job_id)
     status = CELERY_TO_JOB_STATUS.get(task_result.status, JobStatus.FAILED)
     result = None
     error = None
+    temp_files = []
 
     if task_result.successful():
         task_output = task_result.result
@@ -434,6 +455,7 @@ async def get_job_status_endpoint(job_id: str) -> JobStatusResponse:
             status = JobStatus(task_output.get("status", JobStatus.COMPLETED))
             result = task_output.get("result")
             error = task_output.get("error")
+            temp_files = task_output.get("temp_files", [])
         else:
             status = JobStatus.COMPLETED
             result = task_result.result
@@ -443,6 +465,10 @@ async def get_job_status_endpoint(job_id: str) -> JobStatusResponse:
     elif task_result.status == "REVOKED":
         status = JobStatus.CANCELLED
         error = "Job was cancelled by user"
+
+    # Trigger cleanup for completed jobs
+    if status == JobStatus.COMPLETED and temp_files:
+        background_tasks.add_task(purge_job_files, temp_files)
 
     return JobStatusResponse(
         job_id=job_id,

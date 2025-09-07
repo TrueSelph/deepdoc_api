@@ -34,6 +34,7 @@ def process_document_task(self, file_paths: List[str], params: dict, callback_ur
         Dict with job status, result, and error information
     """
     job_id = self.request.id
+    all_temp_files = file_paths[:]  # Start with the original files
     try:
         all_chunks = []
         processed_files = 0
@@ -43,7 +44,7 @@ def process_document_task(self, file_paths: List[str], params: dict, callback_ur
             if self.is_aborted():  # Correct method for checking revocation
                 logger.info(f"Job {job_id} was cancelled during processing")
                 # Trigger callback before returning
-                trigger_callback_task.delay(job_id, callback_url)
+                trigger_callback_task.delay(job_id, callback_url, all_temp_files)
                 return {
                     "status": JobStatus.CANCELLED,
                     "result": None,
@@ -53,33 +54,28 @@ def process_document_task(self, file_paths: List[str], params: dict, callback_ur
             try:
                 logger.info(f"Processing file: {file_path}")
 
-                # Process document
-                chunks = document_processor.process_document(file_path, params)
+                # Process document and collect temp files
+                chunks, temp_files = document_processor.process_document(file_path, params)
                 all_chunks.extend(chunks)
+                all_temp_files.extend(temp_files)
                 processed_files += 1
-
-                # Clean up processed file
-                try:
-                    os.remove(file_path)
-                    logger.debug(f"Removed processed file: {file_path}")
-                except OSError as e:
-                    logger.warning(f"Could not remove file {file_path}: {e}")
 
             except Exception as e:
                 logger.error(f"Failed to process file {file_path}: {e}")
                 # Continue with other files even if one fails
+                logger.info(f"Retaining temp files due to processing failure: {temp_files}")
                 continue
 
         if processed_files == 0:
             # Trigger callback before returning
-            trigger_callback_task.delay(job_id, callback_url)
+            trigger_callback_task.delay(job_id, callback_url, all_temp_files)
             raise Exception("No files were successfully processed")
 
         # Check for task revocation one final time
         if self.is_aborted():  # Correct method for checking revocation
             logger.info(f"Job {job_id} was cancelled after processing")
             # Trigger callback before returning
-            trigger_callback_task.delay(job_id, callback_url)
+            trigger_callback_task.delay(job_id, callback_url, all_temp_files)
             return {
                 "status": JobStatus.CANCELLED,
                 "result": None,
@@ -92,28 +88,30 @@ def process_document_task(self, file_paths: List[str], params: dict, callback_ur
             "status": JobStatus.COMPLETED,
             "result": [chunk.dict() for chunk in all_chunks],
             "error": "",
+            "temp_files": all_temp_files   # NEW: list of temp files to clean up
         }
-        trigger_callback_task.delay(job_id, callback_url)
+        trigger_callback_task.delay(job_id, callback_url, all_temp_files)
         return result
 
     except Exception as e:
         logger.error(f"Job {job_id} failed: {e}")
         # Trigger callback before returning
-        trigger_callback_task.delay(job_id, callback_url)
+        trigger_callback_task.delay(job_id, callback_url, all_temp_files)
         return {
             "job_id": job_id,   # Include original job ID
             "status": JobStatus.FAILED,
             "result": None,
             "error": str(e),
-            "traceback": str(e.__traceback__) if e.__traceback__ else None
+            "traceback": str(e.__traceback__) if e.__traceback__ else None,
+            "temp_files": all_temp_files   # NEW: list of temp files to clean up
         }
 
 
 @celery_app.task(bind=True, name="trigger_callback")
-def trigger_callback_task(self, job_id: str, callback_url: str) -> None:
+def trigger_callback_task(self, job_id: str, callback_url: str, temp_files: List[str]) -> None:
     """
     Task to trigger callback to notify about job completion.
-    This task receives the original job ID and callback URL.
+    This task receives the original job ID, callback URL, and list of temporary files to clean up.
     """
     from app.main import trigger_callback
 
@@ -123,8 +121,8 @@ def trigger_callback_task(self, job_id: str, callback_url: str) -> None:
 
     try:
         logger.info(f"Triggering callback for job: {job_id}")
-        # Use the original job ID for callback
-        loop.run_until_complete(trigger_callback(job_id, callback_url))
+        # Use the original job ID for callback and pass the temp_files
+        loop.run_until_complete(trigger_callback(job_id, callback_url, temp_files))
     except Exception as e:
         logger.error(f"Callback task failed for job {job_id}: {e}")
     finally:

@@ -46,7 +46,7 @@ ENV UNO_PATH=/usr/lib/libreoffice/program
 COPY app/ ./app/
 
 # Create necessary directories
-RUN mkdir -p ./uploads ./processed ./app/temp
+RUN mkdir -p ./uploads ./app/temp
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1

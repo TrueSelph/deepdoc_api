@@ -12,7 +12,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from multiprocessing.connection import Connection
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Union
+from typing import Any, Dict, List, Optional, Set, Union, Tuple
 
 from app.embeddings import embedding_client
 from app.models import ChunkMetadata, ChunkResult
@@ -102,11 +102,13 @@ class DocumentConverter:
 
         # Already PDF: copy if different path
         if file_ext == ".pdf":
+            logger.info(f"Bypassing conversion for PDF file: {input_path}")
             if os.path.abspath(input_path) == os.path.abspath(output_path):
                 return True
             _ensure_dir(output_path)
             try:
                 shutil.copy2(input_path, output_path)
+                logger.info(f"Copied PDF to {output_path}")
                 return True
             except Exception as e:
                 logger.error("Failed to copy PDF: %s", e)
@@ -305,7 +307,7 @@ code {{ white-space: pre-wrap; }}
 
             cmd = [
                 "unoconvert",
-                "--server",
+                "--host",
                 unoserver_host,
                 "--port",
                 unoserver_port,
@@ -454,7 +456,7 @@ class DocumentProcessor:
         self.embedding_executor = ThreadPoolExecutor(max_workers=3)
         self.document_converter = DocumentConverter()
 
-    def process_document(self, file_path: str, params: dict) -> List[ChunkResult]:
+    def process_document(self, file_path: str, params: dict) -> Tuple[List[ChunkResult], List[str]]:
         """Process a single document using Docling's DocumentConverter and HybridChunker.
 
         Args:
@@ -462,62 +464,71 @@ class DocumentProcessor:
             params: Processing parameters dictionary
 
         Returns:
-            List of processed chunks with metadata
+            Tuple of processed chunks and list of temporary files to clean up
         """
         original_filename = _extract_original_filename(file_path, params)
         file_ext = os.path.splitext(file_path)[1].lower()
+        temp_files = []  # Track all temporary files for cleanup
 
-        # If the file is a .docx, convert it to PDF first
-        if file_ext == ".docx":
+        # Bypass conversion for PDF files
+        if file_ext == ".pdf":
+            logger.info(f"Bypassing conversion for PDF file: {file_path}")
+            processing_file_path = file_path
+        else:
             upload_dir = os.getenv("UPLOAD_DIR", "./uploads")
             temp_dir = os.path.join(upload_dir, "temp")
             os.makedirs(temp_dir, exist_ok=True)
 
             temp_pdf_path = os.path.join(temp_dir, f"converted_{uuid.uuid4().hex}.pdf")
 
+            logger.info(f"Converting non-PDF file to PDF: {file_path}")
             conversion_success = self.document_converter.convert_to_pdf(
                 file_path, temp_pdf_path
             )
 
             if conversion_success:
                 processing_file_path = temp_pdf_path
+                temp_files.append(temp_pdf_path)  # Track converted PDF for cleanup
             else:
                 logger.warning(
-                    "DOCX to PDF conversion failed for %s, attempting direct processing",
+                    "PDF conversion failed for %s, attempting direct processing",
                     file_path,
                 )
                 processing_file_path = file_path
-        else:
-            processing_file_path = file_path
 
         # use the multiprocessing approach with timeout
         timeout_seconds = max(10, int(params.get("timeout_seconds", 600)))
 
         try:
-            chunks = self._run_docling_with_timeout(
+            chunks, docling_temp_files = self._run_docling_with_timeout(
                 file_path=processing_file_path,
                 original_filename=original_filename,
                 timeout_seconds=timeout_seconds,
             )
             if not chunks:
                 raise RuntimeError("Docling worker returned no chunks")
+            
+            # Add Docling temp files to cleanup list
+            temp_files.extend(docling_temp_files)
 
             # Generate embeddings if requested
             if params.get("with_embeddings", False) and chunks:
                 self._attach_embeddings(chunks)
 
-            return chunks
+            return chunks, temp_files
 
         except Exception as e:
             logger.error(
                 "Docling processing failed for %s: %s. Falling back.", file_path, e
             )
             fallback_processor = FallbackDocumentProcessor()
-            return fallback_processor.process_document(
+            chunks, fallback_temp_files = fallback_processor.process_document(
                 file_path, params, original_filename
             )
+            temp_files.extend(fallback_temp_files)
+            return chunks, temp_files
 
-    def _process_with_docling(self, file_path: str) -> List[Dict[str, Any]]:
+    def _process_with_docling(self, file_path: str) -> Tuple[List[Dict[str, Any]], List[str]]:
         """Common function to process document using Docling with PDF conversion.
 
         This function ensures documents are converted to PDF format before processing.
@@ -637,7 +648,7 @@ class DocumentProcessor:
                 }
                 chunks_data.append(chunk_data)
 
-            return chunks_data
+            return chunks_data, [temp_pdf_path] if temp_pdf_path else []
 
         except Exception as e:
             logger.error("Failed to process document %s: %s", file_path, e)
@@ -646,8 +657,11 @@ class DocumentProcessor:
         finally:
             # Clean up temporary PDF file if it was created
             if temp_pdf_path and os.path.exists(temp_pdf_path):
-                # We are keeping the file for debugging purposes
-                pass
+                try:
+                    os.remove(temp_pdf_path)
+                    logger.debug(f"Removed temporary PDF: {temp_pdf_path}")
+                except Exception as e:
+                    logger.error(f"Failed to remove temporary PDF {temp_pdf_path}: {e}")
 
     def _collect_chunk_pages(self, dl_chunk: object) -> List[int]:
         """Collect 1-based page numbers from a docling chunk.
@@ -909,7 +923,7 @@ class DocumentProcessor:
         file_path: str,
         original_filename: str,
         timeout_seconds: int,
-    ) -> List[ChunkResult]:
+    ) -> Tuple[List[ChunkResult], List[str]]:
         """Run Docling processing with timeout using threading.
 
         Args:
@@ -918,7 +932,7 @@ class DocumentProcessor:
             timeout_seconds: Timeout in seconds
 
         Returns:
-            List of processed chunks with metadata
+            Tuple of processed chunks and list of temporary files to clean up
 
         Raises:
             TimeoutError: If processing times out
@@ -930,7 +944,7 @@ class DocumentProcessor:
         with ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(self._process_with_docling, file_path)
             try:
-                chunks_data = future.result(timeout=timeout_seconds)
+                chunks_data, temp_files = future.result(timeout=timeout_seconds)
             except TimeoutError:
                 future.cancel()
                 raise TimeoutError(
@@ -954,8 +968,8 @@ class DocumentProcessor:
                 chunk_overlap=0,
             )
             chunks.append(ChunkResult(id=chunk_id, metadata=meta, text=text))
-
-        return chunks
+            
+        return chunks, temp_files
 
     def _attach_embeddings(self, chunks: List[ChunkResult]) -> None:
         """Generate embeddings for chunks one at a time to handle large documents.
@@ -1023,7 +1037,7 @@ class FallbackDocumentProcessor:
 
     def process_document(
         self, file_path: str, params: dict, original_filename: Optional[str] = None
-    ) -> List[ChunkResult]:
+    ) -> Tuple[List[ChunkResult], List[str]]:
         """Process document using fallback methods.
 
         Args:
@@ -1032,7 +1046,7 @@ class FallbackDocumentProcessor:
             original_filename: Original filename without job ID prefix
 
         Returns:
-            List of processed chunks with metadata
+            Tuple of processed chunks and empty temp files list (fallback doesn't create temp files)
         """
         try:
             if original_filename is None:
@@ -1059,7 +1073,7 @@ class FallbackDocumentProcessor:
             if params.get("with_embeddings", False) and chunks:
                 self._attach_embeddings(chunks)
 
-            return chunks
+            return chunks, []  # Fallback doesn't create temp files
 
         except Exception as e:
             logger.error("Fallback processing failed for %s: %s", file_path, e)
@@ -1073,7 +1087,7 @@ class FallbackDocumentProcessor:
                     ),
                     text=f"Error processing document: {str(e)}",
                 )
-            ]
+            ], []
 
     def _attach_embeddings(self, chunks: List[ChunkResult]) -> None:
         """Generate embeddings for chunks using the external embedding service.
@@ -1213,7 +1227,23 @@ class FallbackDocumentProcessor:
             if start <= 0:
                 start = end
 
-        return chunks
+        # Convert chunk data to ChunkResult objects
+        chunks: List[ChunkResult] = []
+        for ch in chunks_data:
+            text = (ch.get("text") or "").strip()
+            if not text:
+                continue
+            pages = ch.get("pages", [1])
+            chunk_id = f"chunk_{uuid.uuid4().hex}"
+            meta = ChunkMetadata(
+                page_num_int=pages,
+                original_filename=original_filename,
+                chunk_size=len(text),
+                chunk_overlap=0,
+            )
+            chunks.append(ChunkResult(id=chunk_id, metadata=meta, text=text))
+            
+        return chunks, temp_files
 
 
 # Create processor instance

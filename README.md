@@ -101,7 +101,6 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8991
 | `EMBEDDING_MODEL` | Model to use for embeddings | `intfloat/multilingual-e5-large-instruct` |
 | `REDIS_URL` | Redis connection URL | `redis://localhost:6379/0` |
 | `UPLOAD_DIR` | Directory for uploaded files | `./uploads` |
-| `PROCESSED_DIR` | Directory for processed files | `./processed` |
 | `MAX_FILE_SIZE` | Maximum file size in bytes | `52428800` (50MB) |
 
 ## Usage Examples

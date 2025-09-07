@@ -1,4 +1,3 @@
-version: "3.8"
 services:
   docling-api:
     build: .
@@ -9,12 +8,10 @@ services:
       - EMBEDDING_SERVICE_URL=${EMBEDDING_SERVICE_URL}
       - EMBEDDING_SERVICE_API_KEY=${EMBEDDING_SERVICE_API_KEY}
       - UPLOAD_DIR=/app/uploads
-      - PROCESSED_DIR=/app/processed
       - UNOSERVER_HOST=unoserver
       - UNOSERVER_PORT=2002
     volumes:
       - uploads_data:/app/uploads
-      - processed_data:/app/processed
     depends_on:
       - redis
       - unoserver
@@ -28,13 +25,11 @@ services:
       - EMBEDDING_SERVICE_URL=${EMBEDDING_SERVICE_URL}
       - EMBEDDING_SERVICE_API_KEY=${EMBEDDING_SERVICE_API_KEY}
       - UPLOAD_DIR=/app/uploads
-      - PROCESSED_DIR=/app/processed
       - C_FORCE_ROOT=true
       - UNOSERVER_HOST=unoserver
       - UNOSERVER_PORT=2002
     volumes:
       - uploads_data:/app/uploads
-      - processed_data:/app/processed
     depends_on:
       - redis
       - unoserver
