@@ -320,7 +320,7 @@ code {{ white-space: pre-wrap; }}
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                timeout=300,
+                timeout=360,
             )
 
             if proc.returncode != 0:
@@ -368,7 +368,7 @@ code {{ white-space: pre-wrap; }}
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                timeout=300,
+                timeout=360,
             )
             candidate = tmp_outdir / (in_path.stem + ".pdf")
             if proc.returncode != 0 or not candidate.exists():
@@ -491,7 +491,7 @@ class DocumentProcessor:
             processing_file_path = file_path
 
         # use the multiprocessing approach with timeout
-        timeout_seconds = max(10, int(params.get("timeout_seconds", 180)))
+        timeout_seconds = max(10, int(params.get("timeout_seconds", 600)))
 
         try:
             chunks = self._run_docling_with_timeout(
@@ -535,6 +535,30 @@ class DocumentProcessor:
         try:
             from docling.chunking import HybridChunker
             from docling.document_converter import DocumentConverter
+            
+            # Suppress pin_memory warning when no GPU is available
+            import torch
+            if not torch.cuda.is_available():
+                # Disable CUDA backend optimizations
+                torch.backends.cuda.matmul.allow_tf32 = False
+                torch.backends.cudnn.benchmark = False
+                torch.backends.cudnn.deterministic = False
+                torch.backends.cudnn.enabled = False
+                torch.backends.cudnn.allow_tf32 = False
+                
+                # Disable pin_memory in data loaders
+                import os
+                os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
+                
+                # Monkey-patch DataLoader to force pin_memory=False
+                import torch.utils.data
+                original_dataloader = torch.utils.data.DataLoader
+                
+                def patched_dataloader(*args, **kwargs):
+                    kwargs['pin_memory'] = False
+                    return original_dataloader(*args, **kwargs)
+                    
+                torch.utils.data.DataLoader = patched_dataloader
         except ImportError as e:
             raise ImportError(f"Required Docling components not available: {e}")
 
