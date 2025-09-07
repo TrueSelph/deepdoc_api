@@ -229,7 +229,13 @@ async def trigger_callback(job_id: str, callback_url: str) -> None:
                 result = task_result.result
         elif task_result.failed():
             status = JobStatus.FAILED
-            error = str(task_result.info or task_result.result)
+            
+            # For failed tasks, result contains the error dictionary
+            if isinstance(task_result.result, dict):
+                error = task_result.result.get("error", "Unknown error")
+            else:
+                error = str(task_result.result) or "Unknown error"
+                
         elif task_result.status == "REVOKED":
             status = JobStatus.CANCELLED
             error = "Job was cancelled by user"
@@ -392,14 +398,16 @@ async def upload_and_chunk_endpoint(
 
     # Start Celery task for document processing
     if callback_url:
-        # Chain the callback task to run after processing completes
-        task = process_document_task.apply_async(
-            args=[file_paths, params],
-            link=trigger_callback_task.s(callback_url),
-        )
+        # Start the processing task
+        task = process_document_task.apply_async(args=[file_paths, params])
+        logger.info(f"Started processing task with ID: {task.id}")
+        # Pass the original job ID to the callback task
+        callback_task = trigger_callback_task.apply_async(args=[task.id, callback_url])
+        logger.info(f"Started callback task with ID: {callback_task.id} for processing task ID: {task.id}")
     else:
         # Just run the processing task without a callback
         task = process_document_task.delay(file_paths, params)
+        logger.info(f"Started processing task without callback: {task.id}")
 
     return {"job_id": task.id}
 

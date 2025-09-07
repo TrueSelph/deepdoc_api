@@ -886,7 +886,7 @@ class DocumentProcessor:
         original_filename: str,
         timeout_seconds: int,
     ) -> List[ChunkResult]:
-        """Run Docling processing with timeout using multiprocessing.
+        """Run Docling processing with timeout using threading.
 
         Args:
             file_path: Path to the document file
@@ -900,68 +900,35 @@ class DocumentProcessor:
             TimeoutError: If processing times out
             RuntimeError: If worker returns invalid result or error
         """
-        # Use 'spawn' method to avoid fork issues
-        ctx = mp.get_context("spawn")
-        parent_conn, child_conn = ctx.Pipe(duplex=False)
-        proc = ctx.Process(
-            target=_docling_worker_process,
-            args=(file_path, child_conn),
-            daemon=True,
-        )
-        proc.start()
-        child_conn.close()  # close child end in parent
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
-        try:
-            if parent_conn.poll(timeout_seconds):
-                result = parent_conn.recv()
-            else:
-                # Timeout: terminate and raise
-                proc.terminate()
-                proc.join(timeout=5)
+        # Run processing in a thread with timeout
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(self._process_with_docling, file_path)
+            try:
+                chunks_data = future.result(timeout=timeout_seconds)
+            except TimeoutError:
+                future.cancel()
                 raise TimeoutError(
                     f"Docling processing timed out after {timeout_seconds}s"
                 )
-        finally:
-            if proc.is_alive():
-                proc.terminate()
-            proc.join(timeout=5)
-            with contextlib.suppress(Exception):
-                parent_conn.close()
+            except Exception as e:
+                raise RuntimeError(f"Docling processing failed: {e}")
 
-        if not isinstance(result, dict):
-            raise RuntimeError("Invalid result type from Docling worker")
-
-        if not result.get("ok"):
-            raise RuntimeError(result.get("error", "Unknown Docling worker error"))
-
-        # Convert worker chunk dicts to ChunkResult with metadata
-        chunks_dicts: List[Dict[str, Any]] = result.get("chunks", [])
+        # Convert chunk data to ChunkResult objects
         chunks: List[ChunkResult] = []
-        for _idx, ch in enumerate(chunks_dicts, start=1):
+        for ch in chunks_data:
             text = (ch.get("text") or "").strip()
             if not text:
                 continue
-            # Prefer pages from worker output; otherwise try to re-collect
-            pages = (
-                ch.get("pages")
-                if isinstance(ch, dict)
-                else self._collect_chunk_pages(ch)
-            )
-            # Extract bounding box data (not available from worker; remains None)
-            bbox_data = (
-                self._collect_bounding_box(ch) if not isinstance(ch, dict) else None
-            )
+            pages = ch.get("pages", [1])
             chunk_id = f"chunk_{uuid.uuid4().hex}"
             meta = ChunkMetadata(
-                page_num_int=pages or [1],
+                page_num_int=pages,
                 original_filename=original_filename,
                 chunk_size=len(text),
                 chunk_overlap=0,
             )
-            # Add bounding box to metadata if available
-            if bbox_data:
-                meta.bbox = bbox_data
-
             chunks.append(ChunkResult(id=chunk_id, metadata=meta, text=text))
 
         return chunks
@@ -1012,42 +979,6 @@ class DocumentProcessor:
             logger.warning("%d chunks failed to generate embeddings", failed_embeddings)
 
 
-def _docling_worker_process(file_path: str, conn: Connection) -> None:
-    """Worker process entrypoint for Docling processing.
-
-    Args:
-        file_path: Path to the document file
-        conn: Pipe connection for communication with parent process
-    """
-    # Set environment variables to prevent MPS issues
-    if sys.platform == "darwin":
-        os.environ.update(
-            {"PYTORCH_ENABLE_MPS_FALLBACK": "1", "PYTORCH_MPS_DISABLE": "1"}
-        )
-
-    try:
-        # Create processor instance to use the common processing function
-        processor = DocumentProcessor()
-        chunks_data = processor._process_with_docling(file_path)
-
-        # Prepare output for pipe communication
-        out_chunks: List[Dict[str, Any]] = []
-        for i, chunk_data in enumerate(chunks_data):
-            out_chunks.append(
-                {
-                    "text": chunk_data["text"],
-                    "pages": chunk_data["pages"],
-                    "chunk_index": i,
-                }
-            )
-
-        conn.send({"ok": True, "chunks": out_chunks})
-        conn.close()
-
-    except Exception as e:
-        with contextlib.suppress(Exception):
-            conn.send({"ok": False, "error": f"{type(e).__name__}: {e}"})
-            conn.close()
 
 
 class FallbackDocumentProcessor:

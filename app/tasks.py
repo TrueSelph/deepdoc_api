@@ -81,6 +81,7 @@ def process_document_task(self, file_paths: List[str], params: dict) -> Dict:
 
         # Update job status
         return {
+            "job_id": job_id,   # Include original job ID
             "status": JobStatus.COMPLETED,
             "result": [chunk.dict() for chunk in all_chunks],
             "error": "",
@@ -88,27 +89,30 @@ def process_document_task(self, file_paths: List[str], params: dict) -> Dict:
 
     except Exception as e:
         logger.error(f"Job {job_id} failed: {e}")
-        return {"status": JobStatus.FAILED, "result": None, "error": str(e)}
+        return {
+            "job_id": job_id,   # Include original job ID
+            "status": JobStatus.FAILED,
+            "result": None,
+            "error": str(e),
+            "traceback": str(e.__traceback__) if e.__traceback__ else None
+        }
 
 
 @celery_app.task(bind=True, name="trigger_callback")
-def trigger_callback_task(self, previous_result: Dict, callback_url: str) -> None:
+def trigger_callback_task(self, job_id: str, callback_url: str) -> None:
     """
     Task to trigger callback to notify about job completion.
-    This task is designed to be chained after another task, receiving its result.
+    This task receives the original job ID and callback URL.
     """
     from app.main import trigger_callback
-
-    # The result of the previous task is passed as `previous_result`
-    job_data = previous_result
-    job_id = self.request.id
 
     # Run the async function in a new event loop
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
     try:
-        # We reuse the trigger_callback function from the main app
+        logger.info(f"Triggering callback for job: {job_id}")
+        # Use the original job ID for callback
         loop.run_until_complete(trigger_callback(job_id, callback_url))
     except Exception as e:
         logger.error(f"Callback task failed for job {job_id}: {e}")
