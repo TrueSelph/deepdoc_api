@@ -399,11 +399,8 @@ async def upload_and_chunk_endpoint(
     # Start Celery task for document processing
     if callback_url:
         # Start the processing task
-        task = process_document_task.apply_async(args=[file_paths, params])
+        task = process_document_task.apply_async(args=[file_paths, params, callback_url])
         logger.info(f"Started processing task with ID: {task.id}")
-        # Pass the original job ID to the callback task
-        callback_task = trigger_callback_task.apply_async(args=[task.id, callback_url])
-        logger.info(f"Started callback task with ID: {callback_task.id} for processing task ID: {task.id}")
     else:
         # Just run the processing task without a callback
         task = process_document_task.delay(file_paths, params)

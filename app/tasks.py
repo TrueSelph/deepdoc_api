@@ -21,13 +21,14 @@ logger = logging.getLogger(__name__)
 
 
 @celery_app.task(bind=True, name="process_document", base=AbortableTask)
-def process_document_task(self, file_paths: List[str], params: dict) -> Dict:
+def process_document_task(self, file_paths: List[str], params: dict, callback_url: str) -> Dict:
     """
     Celery task to process documents
 
     Args:
         file_paths: List of paths to files to process
         params: Additional parameters for processing
+        callback_url: URL to notify when processing completes
 
     Returns:
         Dict with job status, result, and error information
@@ -41,6 +42,8 @@ def process_document_task(self, file_paths: List[str], params: dict) -> Dict:
             # Check for task revocation using supported method
             if self.is_aborted():  # Correct method for checking revocation
                 logger.info(f"Job {job_id} was cancelled during processing")
+                # Trigger callback before returning
+                trigger_callback_task.delay(job_id, callback_url)
                 return {
                     "status": JobStatus.CANCELLED,
                     "result": None,
@@ -68,27 +71,35 @@ def process_document_task(self, file_paths: List[str], params: dict) -> Dict:
                 continue
 
         if processed_files == 0:
+            # Trigger callback before returning
+            trigger_callback_task.delay(job_id, callback_url)
             raise Exception("No files were successfully processed")
 
         # Check for task revocation one final time
         if self.is_aborted():  # Correct method for checking revocation
             logger.info(f"Job {job_id} was cancelled after processing")
+            # Trigger callback before returning
+            trigger_callback_task.delay(job_id, callback_url)
             return {
                 "status": JobStatus.CANCELLED,
                 "result": None,
                 "error": "Job was cancelled by user after processing",
             }
 
-        # Update job status
-        return {
+        # Update job status and trigger callback
+        result = {
             "job_id": job_id,   # Include original job ID
             "status": JobStatus.COMPLETED,
             "result": [chunk.dict() for chunk in all_chunks],
             "error": "",
         }
+        trigger_callback_task.delay(job_id, callback_url)
+        return result
 
     except Exception as e:
         logger.error(f"Job {job_id} failed: {e}")
+        # Trigger callback before returning
+        trigger_callback_task.delay(job_id, callback_url)
         return {
             "job_id": job_id,   # Include original job ID
             "status": JobStatus.FAILED,
