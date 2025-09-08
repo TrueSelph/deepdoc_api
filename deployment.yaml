@@ -12,13 +12,26 @@ spec:
     metadata:
       labels:
         app: deepdoc-api
+        volume-type: uploads-shared
     spec:
+      affinity:
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: volume-type
+                    operator: In
+                    values:
+                      - uploads-shared
+              topologyKey: kubernetes.io/hostname
       containers:
         - name: deepdoc-api
           image: registry.v75inc.dev/deepdoc_api/api:latest
           ports:
             - containerPort: 8991
           env:
+            - name: REDIS_URL
+              value: "redis://redis:6379/0"
             - name: EMBEDDING_SERVICE_URL
               value: "https://embeddings.trueselph.com/openai/v1"
             - name: EMBEDDING_SERVICE_API_KEY
@@ -27,19 +40,22 @@ spec:
                   name: deepdoc-secret
                   key: EMBEDDING_SERVICE_API_KEY
             - name: UPLOAD_DIR
-              value: "./uploads"
-            - name: MAX_FILE_SIZE
-              value: "52428800"
-            - name: EMBEDDING_MODEL
-              value: "intfloat/multilingual-e5-large-instruct"
-            - name: REDIS_HOST
-              value: ""
-            - name: REDIS_PORT
-              value: "6379"
-            - name: MAX_PAGES_PER_BATCH
-              value: "20"
-            - name: EMPTY_BATCH_THRESHOLD
-              value: "2"
+              value: "/app/uploads"
+            - name: UNOSERVER_HOST
+              value: "unoserver"
+            - name: UNOSERVER_PORT
+              value: "2002"
+          command:
+            [
+              "uvicorn",
+              "app.main:app",
+              "--host",
+              "0.0.0.0",
+              "--port",
+              "8991",
+              "--workers",
+              "2",
+            ]
           livenessProbe:
             httpGet:
               path: /health
@@ -63,6 +79,171 @@ spec:
             limits:
               cpu: 2
               memory: 6Gi
+          volumeMounts:
+            - name: uploads-data
+              mountPath: /app/uploads
+      volumes:
+        - name: uploads-data
+          persistentVolumeClaim:
+            claimName: uploads-data-pvc
+---
+# Celery Worker Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: celery-worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: celery-worker
+  template:
+    metadata:
+      labels:
+        app: celery-worker
+        volume-type: uploads-shared
+    spec:
+      affinity:
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: volume-type
+                    operator: In
+                    values:
+                      - uploads-shared
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: celery-worker
+          image: registry.v75inc.dev/deepdoc_api/api:latest
+          env:
+            - name: REDIS_URL
+              value: "redis://redis:6379/0"
+            - name: EMBEDDING_SERVICE_URL
+              value: "https://embeddings.trueselph.com/openai/v1"
+            - name: EMBEDDING_SERVICE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: deepdoc-secret
+                  key: EMBEDDING_SERVICE_API_KEY
+            - name: UPLOAD_DIR
+              value: "/app/uploads"
+            - name: C_FORCE_ROOT
+              value: "true"
+            - name: UNOSERVER_HOST
+              value: "unoserver"
+            - name: UNOSERVER_PORT
+              value: "2002"
+          command:
+            ["celery", "-A", "app.celery_app", "worker", "--loglevel=info"]
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: 1
+              memory: 2Gi
+          volumeMounts:
+            - name: uploads-data
+              mountPath: /app/uploads
+      volumes:
+        - name: uploads-data
+          persistentVolumeClaim:
+            claimName: uploads-data-pvc
+---
+# UnoServer Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: unoserver
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: unoserver
+  template:
+    metadata:
+      labels:
+        app: unoserver
+    spec:
+      containers:
+        - name: unoserver
+          image: registry.v75inc.dev/deepdoc_api/api:latest
+          ports:
+            - containerPort: 2002
+            - containerPort: 2003
+          env:
+            - name: C_FORCE_ROOT
+              value: "true"
+          command:
+            [
+              "unoserver",
+              "--interface",
+              "0.0.0.0",
+              "--port",
+              "2002",
+              "--uno-port",
+              "2003",
+            ]
+          livenessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - "import xmlrpc.client; xmlrpc.client.ServerProxy('http://localhost:2002').info()"
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - "import xmlrpc.client; xmlrpc.client.ServerProxy('http://localhost:2002').info()"
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: 500m
+              memory: 1Gi
+---
+# Flower Deployment (Optional Celery monitoring)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flower
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: flower
+  template:
+    metadata:
+      labels:
+        app: flower
+    spec:
+      containers:
+        - name: flower
+          image: registry.v75inc.dev/deepdoc_api/api:latest
+          ports:
+            - containerPort: 5555
+          env:
+            - name: REDIS_URL
+              value: "redis://redis:6379/0"
+          command: ["celery", "-A", "app.celery_app", "flower", "--port=5555"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 200m
+              memory: 512Mi
 ---
 # API Service
 apiVersion: v1
@@ -79,6 +260,37 @@ spec:
       targetPort: 8991
   selector:
     app: deepdoc-api
+  type: ClusterIP
+---
+# UnoServer Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: unoserver
+spec:
+  ports:
+    - name: unoserver
+      port: 2002
+      targetPort: 2002
+    - name: uno-port
+      port: 2003
+      targetPort: 2003
+  selector:
+    app: unoserver
+  type: ClusterIP
+---
+# Flower Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: flower
+spec:
+  ports:
+    - name: http
+      port: 5555
+      targetPort: 5555
+  selector:
+    app: flower
   type: ClusterIP
 ---
 # API Ingress
@@ -107,13 +319,39 @@ spec:
                 port:
                   number: 80
 ---
+# Flower Ingress (Optional - for Celery monitoring)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: flower
+  annotations:
+    alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:us-east-2:682833334575:certificate/f2bd1517-b01c-4fcc-9535-d5843a1339c1
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS":443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    external-dns.alpha.kubernetes.io/hostname: flower.trueselph.com
+spec:
+  ingressClassName: alb
+  rules:
+    - host: flower.trueselph.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: flower
+                port:
+                  number: 5555
+---
 # Redis StatefulSet
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: redis
 spec:
-  serviceName: "redis-headless"
+  serviceName: "redis"
   replicas: 1
   selector:
     matchLabels:
@@ -125,18 +363,19 @@ spec:
     spec:
       containers:
         - name: redis
-          image: redis:7
-          env:
-            - name: REDIS_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: redis-secret
-                  key: REDIS_PASSWORD
+          image: redis:7-alpine
           ports:
             - containerPort: 6379
           volumeMounts:
             - name: redis-persistent-storage
               mountPath: /data
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 1Gi
   volumeClaimTemplates:
     - metadata:
         name: redis-persistent-storage
@@ -147,18 +386,29 @@ spec:
           requests:
             storage: 10Gi
 ---
-# PostgreSQL Headless Service
+# Redis Service
 apiVersion: v1
 kind: Service
 metadata:
-  name: redis-headless
+  name: redis
   labels:
     app: redis
 spec:
   ports:
     - port: 6379
-  clusterIP: None
   selector:
     app: redis
+  type: ClusterIP
 ---
-
+# Uploads Data PVC
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: uploads-data-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: gp2
+  resources:
+    requests:
+      storage: 50Gi
