@@ -1342,9 +1342,6 @@ class DocumentProcessor:
                     )
 
                     embedding = embedding_client.generate_embedding(chunk.text)
-                    logger.info(
-                        f"Embedding response received for chunk {i + 1}: {type(embedding)}"
-                    )
 
                     if embedding and len(embedding) > 0:
                         chunk.embeddings = embedding
