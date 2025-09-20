@@ -41,3 +41,6 @@ class JobStatusResponse(BaseModel):
     status: JobStatus
     result: Optional[List[ChunkResult]] = None
     error: Optional[str] = None
+    stage: Optional[str] = None
+    progress: Optional[int] = None
+    details: Optional[Dict] = None

@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from multiprocessing.connection import Connection
@@ -88,17 +89,35 @@ class DocumentConverter:
         """Initialize the document converter."""
         self._soffice_path = _which("soffice") or _which("libreoffice")
 
-    def convert_to_pdf(self, input_path: str, output_path: str) -> bool:
+    def convert_to_pdf(
+        self, input_path: str, output_path: str, job_id: Optional[str] = None
+    ) -> bool:
         """Convert document to PDF using appropriate method based on file extension.
 
         Args:
             input_path: Path to input file
             output_path: Path to output PDF file
+            job_id: Job ID for progress tracking (optional)
 
         Returns:
             True if conversion succeeded, False otherwise
         """
         file_ext = os.path.splitext(input_path)[1].lower()
+
+        # Send progress update for conversion start
+        if job_id:
+            from app.main import update_job_progress
+
+            update_job_progress(
+                job_id,
+                f"Converting {os.path.basename(input_path)} to PDF",
+                5,
+                {
+                    "current_operation": "Document conversion",
+                    "conversion_format": file_ext,
+                    "stage": "conversion_start",
+                },
+            )
 
         # Already PDF: copy if different path
         if file_ext == ".pdf":
@@ -107,9 +126,21 @@ class DocumentConverter:
             _ensure_dir(output_path)
             try:
                 shutil.copy2(input_path, output_path)
+                # Send progress update for completion
+                if job_id:
+                    update_job_progress(
+                        job_id,
+                        "PDF copy completed",
+                        15,
+                        {
+                            "current_operation": "Document conversion",
+                            "stage": "conversion_complete",
+                            "method": "copy",
+                        },
+                    )
                 return True
             except Exception as e:
-                logger.error("Failed to copy PDF: %s", e)
+                logger.exception("Failed to copy PDF: %s", e)
                 return False
 
         # Images - Pillow
@@ -211,7 +242,7 @@ class DocumentConverter:
             with open(input_path, "r", encoding="utf-8", errors="ignore") as f:
                 raw = f.read()
         except Exception as e:
-            logger.error("Failed reading text file: %s", e)
+            logger.exception("Failed reading text file: %s", e)
             return False
 
         ext = os.path.splitext(input_path)[1].lower()
@@ -269,7 +300,7 @@ code {{ white-space: pre-wrap; }}
         try:
             tmp_html.write_text(html_doc, encoding="utf-8")
         except Exception as e:
-            logger.error("Failed writing temp HTML: %s", e)
+            logger.exception("Failed writing temp HTML: %s", e)
             return False
 
         try:
@@ -412,35 +443,81 @@ class DocumentProcessor:
             List of processed chunks with metadata
         """
         original_filename = _extract_original_filename(file_path, params)
+        job_id = params.get(
+            "job_id"
+        )  # Extract job_id from params for progress tracking
+        logger.info("Starting document processing for: %s", original_filename)
+
+        # Log milestone for document processing start
+        if job_id:
+            from app.main import log_progress_milestone
+
+            log_progress_milestone(
+                job_id, f"Document processing started for {original_filename}", 10
+            )
 
         # use the multiprocessing approach with timeout
-        timeout_seconds = max(10, int(params.get("timeout_seconds", 360)))
+        job_timeout = os.getenv("JOB_TIMEOUT", "14400")
+        timeout_seconds = max(10, int(params.get("timeout_seconds", job_timeout)))
 
         try:
             chunks = self._run_docling_with_timeout(
                 file_path=file_path,
                 original_filename=original_filename,
                 timeout_seconds=timeout_seconds,
+                job_id=job_id,
             )
             if not chunks:
                 raise RuntimeError("Docling worker returned no chunks")
 
             # Generate embeddings if requested
             if params.get("with_embeddings", False) and chunks:
-                self._attach_embeddings(chunks)
+                if job_id:
+                    from app.main import log_progress_milestone
+
+                    log_progress_milestone(job_id, "Starting embedding generation", 75)
+                self._attach_embeddings(chunks, job_id)
+
+            logger.info("Successfully processed document into %d chunks", len(chunks))
+
+            # Log successful completion milestone
+            if job_id:
+                from app.main import log_progress_milestone
+
+                log_progress_milestone(
+                    job_id, f"Document processing completed: {len(chunks)} chunks", 90
+                )
 
             return chunks
 
         except Exception as e:
-            logger.error(
+            logger.exception(
                 "Docling processing failed for %s: %s. Falling back.", file_path, e
             )
+
+            # Update progress to indicate fallback mode
+            if job_id:
+                from app.main import update_job_progress
+
+                update_job_progress(
+                    job_id,
+                    "Primary processing failed, using fallback method",
+                    10,
+                    {
+                        "current_operation": "Fallback processing",
+                        "fallback_reason": str(type(e).__name__),
+                        "original_error": str(e),
+                    },
+                )
+
             fallback_processor = FallbackDocumentProcessor()
             return fallback_processor.process_document(
                 file_path, params, original_filename
             )
 
-    def _process_with_docling(self, file_path: str) -> List[Dict[str, Any]]:
+    def _process_with_docling(
+        self, file_path: str, conn: Connection, job_id: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
         """Common function to process document using Docling with PDF conversion.
 
         This function ensures documents are converted to PDF format before processing.
@@ -472,19 +549,23 @@ class DocumentProcessor:
             # First, detect the input format
             file_ext = os.path.splitext(file_path)[1].lower()
             is_pdf = file_ext == ".pdf"
+            logger.info(f"Processing file with extension: {file_ext}, is_pdf: {is_pdf}")
 
             # Convert non-PDF files to PDF before processing
             if not is_pdf:
                 # Create temporary PDF file in the temp subfolder
                 temp_filename = f"converted_{uuid.uuid4().hex}.pdf"
                 temp_pdf_path = os.path.join(temp_dir, temp_filename)
+                logger.info(f"Converting {file_path} to PDF: {temp_pdf_path}")
 
                 conversion_success = self.document_converter.convert_to_pdf(
-                    file_path, temp_pdf_path
+                    file_path, temp_pdf_path, job_id
                 )
+                logger.info(f"PDF conversion result: {conversion_success}")
 
                 if conversion_success:
                     processing_file_path = temp_pdf_path
+                    logger.info(f"Using converted PDF: {processing_file_path}")
                 else:
                     # If conversion fails, try to process the original file directly
                     logger.warning(
@@ -499,17 +580,79 @@ class DocumentProcessor:
                 # File is already PDF, use directly
                 processing_file_path = file_path
                 original_format = ".pdf"
+                logger.info(f"Processing PDF directly: {processing_file_path}")
+
+            # Verify the processing file exists
+            if not os.path.exists(processing_file_path):
+                raise FileNotFoundError(
+                    f"Processing file does not exist: {processing_file_path}"
+                )
+
+            # Send progress update: conversion complete
+            try:
+                conn.send(
+                    {"progress": {"stage": "conversion_complete", "progress": 10}}
+                )
+                logger.info("Sent conversion_complete progress update")
+            except Exception as progress_e:
+                logger.warning(f"Failed to send conversion progress: {progress_e}")
 
             # Process the document with Docling
-            converter = DocumentConverter()
-            result = converter.convert(source=processing_file_path)
-            doc = result.document
+            logger.info("Starting Docling document conversion...")
+            try:
+                converter = DocumentConverter()
+                result = converter.convert(source=processing_file_path)
+                doc = result.document
+                logger.info("Docling conversion successful")
+            except Exception as docling_e:
+                logger.error(
+                    f"Docling conversion failed: {type(docling_e).__name__}: {docling_e}"
+                )
+                # Try to provide more specific error information
+                if "CUDA" in str(docling_e) or "GPU" in str(docling_e):
+                    raise RuntimeError(f"Docling GPU/CUDA error: {docling_e}")
+                elif "memory" in str(docling_e).lower():
+                    raise RuntimeError(f"Docling memory error: {docling_e}")
+                elif "file" in str(docling_e).lower():
+                    raise RuntimeError(f"Docling file processing error: {docling_e}")
+                else:
+                    raise RuntimeError(f"Docling processing error: {docling_e}")
 
-            # Create chunker and generate chunks
+            # Get document statistics for progress tracking
+            doc_stats = self._get_document_statistics(doc)
+
+            # Send progress update: document loaded
+            try:
+                conn.send(
+                    {
+                        "progress": {
+                            "stage": "document_loaded",
+                            "progress": 20,
+                            "stats": doc_stats,
+                        }
+                    }
+                )
+                logger.info(
+                    f"Sent document_loaded progress update with stats: {doc_stats}"
+                )
+            except Exception as progress_e:
+                logger.warning(f"Failed to send document_loaded progress: {progress_e}")
+
+            # Create chunker and generate chunks with progress tracking
             chunker = HybridChunker()
             chunk_iter = chunker.chunk(dl_doc=doc)
 
             chunks_data: List[Dict[str, Any]] = []
+            processed_elements = 0
+            total_elements = 0
+
+            # First pass: count total elements if not available from stats
+            if doc_stats.get("elements", 0) == 0:
+                temp_chunks = list(chunk_iter)
+                total_elements = len(temp_chunks)
+                chunk_iter = iter(temp_chunks)  # Reset iterator
+            else:
+                total_elements = doc_stats.get("elements", 0)
 
             for chunk in chunk_iter:
                 # Use contextualized text for better results
@@ -536,11 +679,73 @@ class DocumentProcessor:
                 }
                 chunks_data.append(chunk_data)
 
+                # Update progress based on actual processing
+                processed_elements += 1
+                if processed_elements % 3 == 0:  # Send progress more frequently
+                    progress_percent = 20 + int(
+                        (processed_elements / max(total_elements, 1)) * 60
+                    )
+                    try:
+                        conn.send(
+                            {
+                                "progress": {
+                                    "stage": "chunking",
+                                    "progress": progress_percent,
+                                    "chunks_processed": processed_elements,
+                                    "total_chunks": total_elements,
+                                }
+                            }
+                        )
+                        logger.debug(
+                            f"Sent chunking progress: {processed_elements}/{total_elements} ({progress_percent}%)"
+                        )
+                    except Exception as progress_e:
+                        logger.warning(
+                            f"Failed to send chunking progress: {progress_e}"
+                        )
+
+            # Send final progress update
+            with contextlib.suppress(Exception):
+                conn.send(
+                    {
+                        "progress": {
+                            "stage": "processing_complete",
+                            "progress": 80,
+                            "final_stats": {
+                                "total_chunks": len(chunks_data),
+                                "total_pages": doc_stats.get("pages", 0),
+                                "file_size_bytes": doc_stats.get("file_size", 0),
+                            },
+                        }
+                    }
+                )
+
             return chunks_data
 
         except Exception as e:
-            logger.error("Failed to process document %s: %s", file_path, e)
-            raise RuntimeError(f"Document processing failed: {e}")
+            # Log the full exception details
+            logger.error(f"Document processing failed: {type(e).__name__}: {e}")
+            logger.exception("Full exception traceback:")
+
+            # Send error progress update with more details
+            try:
+                conn.send(
+                    {
+                        "progress": {
+                            "stage": "error",
+                            "error": str(e),
+                            "error_type": type(e).__name__,
+                            "file_path": file_path,
+                            "processing_stage": "document_processing",
+                        }
+                    }
+                )
+                logger.info("Sent error progress update to parent process")
+            except Exception as progress_e:
+                logger.error(f"Failed to send error progress: {progress_e}")
+
+            # Re-raise with more context
+            raise RuntimeError(f"Document processing failed: {type(e).__name__}: {e}")
 
         finally:
             # Clean up temporary PDF file if it was created
@@ -733,6 +938,41 @@ class DocumentProcessor:
 
         return bbox_data
 
+    def _get_document_statistics(self, doc: object) -> Dict[str, Any]:
+        """Extract statistics from docling document for progress tracking."""
+        stats = {"pages": 0, "elements": 0, "file_size": 0}
+
+        try:
+            # Try to get page count
+            if hasattr(doc, "pages"):
+                stats["pages"] = len(doc.pages) if hasattr(doc.pages, "__len__") else 0
+
+            # Try to get element count
+            if hasattr(doc, "text_elements"):
+                stats["elements"] = (
+                    len(doc.text_elements)
+                    if hasattr(doc.text_elements, "__len__")
+                    else 0
+                )
+            elif hasattr(doc, "elements"):
+                stats["elements"] = (
+                    len(doc.elements) if hasattr(doc.elements, "__len__") else 0
+                )
+
+            # Try to get file size if source path is available
+            if hasattr(doc, "source") and hasattr(doc.source, "file"):
+                try:
+                    import os
+
+                    stats["file_size"] = os.path.getsize(doc.source.file)
+                except Exception:
+                    pass
+
+        except Exception as e:
+            logger.debug(f"Could not extract document statistics: {e}")
+
+        return stats
+
     def _extract_bbox_from_object(self, bbox_obj: object) -> Optional[Dict[str, float]]:
         """Extract bounding box coordinates from various bbox object formats.
 
@@ -808,6 +1048,7 @@ class DocumentProcessor:
         file_path: str,
         original_filename: str,
         timeout_seconds: int,
+        job_id: Optional[str] = None,  # Pass job_id for progress updates
     ) -> List[ChunkResult]:
         """Run Docling processing with timeout using multiprocessing.
 
@@ -815,6 +1056,7 @@ class DocumentProcessor:
             file_path: Path to the document file
             original_filename: Original filename without job ID prefix
             timeout_seconds: Timeout in seconds
+            job_id: Job ID for progress updates (optional)
 
         Returns:
             List of processed chunks with metadata
@@ -835,15 +1077,116 @@ class DocumentProcessor:
         child_conn.close()  # close child end in parent
 
         try:
-            if parent_conn.poll(timeout_seconds):
-                result = parent_conn.recv()
-            else:
-                # Timeout: terminate and raise
-                proc.terminate()
-                proc.join(timeout=5)
-                raise TimeoutError(
-                    f"Docling processing timed out after {timeout_seconds}s"
-                )
+            # Monitor progress during timeout period
+            start_time = time.time()
+            last_progress_update = 0
+            result = None
+
+            while result is None:
+                if parent_conn.poll(1):  # Wait up to 1 second for a message
+                    try:
+                        message = parent_conn.recv()
+                        if isinstance(message, dict):
+                            if "ok" in message:
+                                result = message  # Found the result
+                            elif "progress" in message:
+                                progress_data = message["progress"]
+                                if job_id:
+                                    from app.main import update_job_progress
+
+                                    if progress_data.get("stage") == "chunking":
+                                        update_job_progress(
+                                            job_id,
+                                            f"Processing chunks: {progress_data.get('chunks_processed', 0)}/{progress_data.get('total_chunks', 0)}",
+                                            progress_data.get("progress", 20),
+                                            {
+                                                "current_operation": "Chunk generation",
+                                                "chunks_processed": progress_data.get(
+                                                    "chunks_processed", 0
+                                                ),
+                                                "total_chunks": progress_data.get(
+                                                    "total_chunks", 0
+                                                ),
+                                                "stage": progress_data.get("stage"),
+                                            },
+                                        )
+                                    elif (
+                                        progress_data.get("stage")
+                                        == "processing_complete"
+                                    ):
+                                        update_job_progress(
+                                            job_id,
+                                            "Document processing complete, generating embeddings",
+                                            80,
+                                            progress_data.get("final_stats", {}),
+                                        )
+                            elif "status" in message:
+                                logger.info(f"Worker status: {message}")
+                            else:
+                                logger.debug(
+                                    f"Unexpected message from worker: {message}"
+                                )
+                    except Exception as e:
+                        logger.debug(f"Failed to process message: {e}")
+                        break
+                else:
+                    # No message received, check for timeout
+                    elapsed = time.time() - start_time
+                    if elapsed >= timeout_seconds:
+                        # Timeout: terminate and raise with detailed error
+                        proc.terminate()
+                        proc.join(timeout=5)
+
+                        # Update progress to indicate timeout
+                        if job_id:
+                            from app.main import update_job_progress
+
+                            update_job_progress(
+                                job_id,
+                                "Processing timed out",
+                                0,
+                                {
+                                    "current_operation": "Timeout occurred",
+                                    "timeout_seconds": timeout_seconds,
+                                    "elapsed_seconds": elapsed,
+                                    "error_type": "TimeoutError",
+                                },
+                            )
+
+                        raise TimeoutError(
+                            f"Docling processing timed out after {timeout_seconds}s for file processing"
+                        )
+
+                    # Fallback: Update progress every 30 seconds if job_id provided and no recent worker updates
+                    if job_id and elapsed - last_progress_update >= 30:
+                        progress = min(85, 15 + int((elapsed / timeout_seconds) * 70))
+                        from app.main import update_job_progress
+
+                        # Add more context about the timeout status
+                        time_remaining = max(0, timeout_seconds - int(elapsed))
+                        if time_remaining > 60:
+                            status_msg = f"Processing document ({int(elapsed)} / {timeout_seconds}s, {time_remaining // 60}m remaining)"
+                        else:
+                            status_msg = f"Processing document ({int(elapsed)}/{timeout_seconds}s, {time_remaining}s remaining)"
+
+                        update_job_progress(
+                            job_id,
+                            status_msg,
+                            progress,
+                            {
+                                "current_operation": "Docling OCR processing",
+                                "elapsed_seconds": int(elapsed),
+                                "timeout_seconds": timeout_seconds,
+                                "remaining_seconds": time_remaining,
+                                "timeout_warning": elapsed
+                                > (timeout_seconds * 0.8),  # Warn in last 20% of time
+                            },
+                        )
+                        last_progress_update = int(elapsed)
+                        logger.info(
+                            f"Docling processing progress: {int(elapsed)}/{timeout_seconds}s ({progress}%)"
+                        )
+            print(f"Docling worker result: {result}")
         finally:
             if proc.is_alive():
                 proc.terminate()
@@ -852,10 +1195,67 @@ class DocumentProcessor:
                 parent_conn.close()
 
         if not isinstance(result, dict):
-            raise RuntimeError("Invalid result type from Docling worker")
+            error_msg = f"Invalid result type from Docling worker: {type(result)}"
+            logger.error(error_msg)
+            if job_id:
+                from app.main import update_job_progress
+
+                update_job_progress(
+                    job_id,
+                    "Worker communication error",
+                    0,
+                    {
+                        "current_operation": "Worker error",
+                        "error_type": "InvalidResultType",
+                        "error_message": error_msg,
+                    },
+                )
+            raise RuntimeError(error_msg)
 
         if not result.get("ok"):
-            raise RuntimeError(result.get("error", "Unknown Docling worker error"))
+            error_details = result.get("error", "Unknown Docling worker error")
+            error_type = result.get("error_type", "UnknownError")
+            traceback_info = result.get("traceback", "No traceback available")
+
+            logger.error(
+                f"Docling worker reported error [{error_type}]: {error_details}"
+            )
+            logger.error(f"Worker traceback: {traceback_info}")
+            logger.error(f"Full worker result: {result}")
+
+            # Provide more specific error messages based on error type
+            if error_type == "ImportError":
+                specific_message = f"Docling library not available: {error_details}"
+            elif "CUDA" in error_details or "GPU" in error_details:
+                specific_message = f"GPU/CUDA error in Docling: {error_details}"
+            elif "memory" in error_details.lower():
+                specific_message = (
+                    f"Memory error in Docling processing: {error_details}"
+                )
+            elif "file" in error_details.lower():
+                specific_message = f"File processing error in Docling: {error_details}"
+            elif error_type == "FileNotFoundError":
+                specific_message = f"Input file not found: {error_details}"
+            else:
+                specific_message = f"Docling processing failed: {error_details}"
+
+            if job_id:
+                from app.main import update_job_progress
+
+                update_job_progress(
+                    job_id,
+                    f"Docling processing failed ({error_type})",
+                    0,
+                    {
+                        "current_operation": "Worker error",
+                        "error_type": error_type,
+                        "error_message": specific_message,
+                        "original_error": error_details,
+                        "traceback": traceback_info,
+                        "worker_result": result,
+                    },
+                )
+            raise RuntimeError(specific_message)
 
         # Convert worker chunk dicts to ChunkResult with metadata
         chunks_dicts: List[Dict[str, Any]] = result.get("chunks", [])
@@ -889,11 +1289,14 @@ class DocumentProcessor:
 
         return chunks
 
-    def _attach_embeddings(self, chunks: List[ChunkResult]) -> None:
+    def _attach_embeddings(
+        self, chunks: List[ChunkResult], job_id: Optional[str] = None
+    ) -> None:
         """Generate embeddings for chunks one at a time to handle large documents.
 
         Args:
             chunks: List of chunks to generate embeddings for
+            job_id: Job ID for progress tracking (optional)
         """
         if not chunks:
             return
@@ -902,37 +1305,200 @@ class DocumentProcessor:
 
         successful_embeddings = 0
         failed_embeddings = 0
+        consecutive_timeouts = 0
+        max_consecutive_timeouts = 5  # Circuit breaker threshold
+
+        # Track overall progress
+        start_time = time.time()
+        total_chunks = len(chunks)
 
         for i, chunk in enumerate(chunks):
-            try:
-                # Process one chunk at a time
-                embedding = embedding_client.generate_embedding(chunk.text)
-                if embedding:
-                    chunk.embeddings = embedding
-                    successful_embeddings += 1
-                else:
-                    logger.warning("Failed to generate embedding for chunk %d", i + 1)
-                    failed_embeddings += 1
+            # Calculate and log overall progress
+            progress_percent = int((i / total_chunks) * 100)
+            elapsed_time = time.time() - start_time
+            avg_time_per_chunk = elapsed_time / (i + 1) if i > 0 else 0
+            estimated_remaining = avg_time_per_chunk * (total_chunks - i - 1)
 
-                # Log progress every 10 chunks
-                if (i + 1) % 10 == 0:
+            logger.info(
+                f"Generating embedding for chunk {i + 1}/{total_chunks} ({progress_percent}%) - "
+                f"Elapsed: {elapsed_time:.1f}s, Remaining: {estimated_remaining:.1f}s"
+            )
+
+            # Log chunk information for debugging
+            chunk_text_preview = (
+                chunk.text[:100] + "..." if len(chunk.text) > 100 else chunk.text
+            )
+            logger.info(f"Chunk text preview: {chunk_text_preview}")
+
+            # Process one chunk at a time with detailed error handling and retries
+            max_retries = 3
+            base_delay = 1.0  # Base delay in seconds
+
+            logger.info(f"length of chunk text: {len(chunk.text)}")
+            for attempt in range(max_retries + 1):
+                try:
                     logger.info(
-                        "Processed %d/%d chunks for embeddings", i + 1, len(chunks)
+                        f"Embedding attempt {attempt + 1}/{max_retries + 1} for chunk {i + 1}"
                     )
 
-            except Exception as e:
-                logger.error("Error generating embedding for chunk %d: %s", i + 1, e)
-                failed_embeddings += 1
-                # Continue with next chunk instead of failing completely
+                    embedding = embedding_client.generate_embedding(chunk.text)
+                    logger.info(
+                        f"Embedding response received for chunk {i + 1}: {type(embedding)}"
+                    )
 
-        logger.info(
-            "Embedding generation completed: %d successful, %d failed",
+                    if embedding and len(embedding) > 0:
+                        chunk.embeddings = embedding
+                        successful_embeddings += 1
+                        consecutive_timeouts = 0  # Reset circuit breaker
+                        logger.info(
+                            f"Successfully generated embedding for chunk {i + 1}"
+                        )
+                        break  # Success, exit retry loop
+                    else:
+                        logger.warning(
+                            f"Empty or invalid embedding response for chunk {i + 1}"
+                        )
+                        failed_embeddings += 1
+                        break  # Don't retry for empty responses
+
+                except Exception as embed_e:
+                    logger.error(
+                        f"Embedding request failed for chunk {i + 1} (attempt {attempt + 1}): {type(embed_e).__name__}: {embed_e}"
+                    )
+
+                    # Check for specific HTTP errors
+                    if hasattr(embed_e, "response") and embed_e.response:
+                        status_code = getattr(embed_e.response, "status_code", None)
+                        logger.error(
+                            f"HTTP error details - Status: {status_code}, URL: {getattr(embed_e.response, 'url', 'unknown')}"
+                        )
+
+                        if status_code == 504:
+                            consecutive_timeouts += 1
+                            logger.warning(
+                                f"Gateway timeout detected - server may be overloaded (consecutive: {consecutive_timeouts})"
+                            )
+
+                            # Circuit breaker: if too many consecutive timeouts, pause longer
+                            if consecutive_timeouts >= max_consecutive_timeouts:
+                                logger.error(
+                                    f"Circuit breaker triggered: {consecutive_timeouts} consecutive timeouts"
+                                )
+                                long_pause = 30.0  # 30 second pause
+                                logger.info(
+                                    f"Circuit breaker: pausing for {long_pause} seconds to let service recover..."
+                                )
+                                time.sleep(long_pause)
+                                consecutive_timeouts = 0  # Reset after long pause
+
+                            if attempt < max_retries:
+                                delay = base_delay * (2**attempt)
+                                if consecutive_timeouts >= 3:
+                                    delay *= 2  # Double delay for consecutive timeouts
+                                logger.info(
+                                    f"Retrying chunk {i + 1} in {delay} seconds..."
+                                )
+                                time.sleep(delay)
+                                continue
+
+                        elif status_code == 429:
+                            logger.warning(
+                                "Rate limit exceeded - adding delay before retry"
+                            )
+                            consecutive_timeouts = max(
+                                0, consecutive_timeouts - 1
+                            )  # Reduce consecutive timeout count
+                            if attempt < max_retries:
+                                delay = (
+                                    base_delay * (2**attempt) * 2
+                                )  # Longer delay for rate limits
+                                logger.info(
+                                    f"Retrying chunk {i + 1} in {delay} seconds..."
+                                )
+                                time.sleep(delay)
+                                continue
+                        elif status_code is not None and status_code >= 500:
+                            logger.warning(
+                                f"Server error {status_code} - embedding service may be down"
+                            )
+                            if attempt < max_retries and status_code in [502, 503, 504]:
+                                consecutive_timeouts += 1
+                                delay = base_delay * (2**attempt)
+                                logger.info(
+                                    f"Retrying chunk {i + 1} in {delay} seconds..."
+                                )
+                                time.sleep(delay)
+                                continue
+
+                    # If we've exhausted retries or it's not a retryable error
+                    if attempt == max_retries:
+                        logger.error(f"All retry attempts failed for chunk {i + 1}")
+                        failed_embeddings += 1
+                    break
+
+            # Log progress every 10 chunks
+            if (i + 1) % 10 == 0:
+                progress_msg = "Processed %d/%d chunks for embeddings" % (
+                    i + 1,
+                    len(chunks),
+                )
+                logger.info(progress_msg)
+
+                # Update progress in Redis if job_id provided
+                if job_id:
+                    from app.main import update_job_progress
+
+                    progress = 80 + int(((i + 1) / len(chunks)) * 20)
+                    update_job_progress(
+                        job_id,
+                        progress_msg,
+                        progress,
+                        {
+                            "current_operation": "Embedding generation",
+                            "chunks_processed": i + 1,
+                            "total_chunks": len(chunks),
+                            "successful_embeddings": successful_embeddings,
+                            "failed_embeddings": failed_embeddings,
+                        },
+                    )
+
+        completion_msg = "Embedding generation completed: %d successful, %d failed" % (
             successful_embeddings,
             failed_embeddings,
         )
+        logger.info(completion_msg)
 
         if failed_embeddings > 0:
             logger.warning("%d chunks failed to generate embeddings", failed_embeddings)
+
+        # Final progress update
+        if job_id:
+            from app.main import log_progress_milestone, update_job_progress
+
+            if failed_embeddings == 0:
+                update_job_progress(
+                    job_id,
+                    "Embeddings generated successfully",
+                    100,
+                    {
+                        "current_operation": "Embeddings completed",
+                        "successful_embeddings": successful_embeddings,
+                        "total_chunks": len(chunks),
+                    },
+                )
+                log_progress_milestone(job_id, "Embedding generation completed", 100)
+            else:
+                update_job_progress(
+                    job_id,
+                    "Embeddings completed with failures",
+                    95,
+                    {
+                        "current_operation": "Embeddings completed with errors",
+                        "successful_embeddings": successful_embeddings,
+                        "failed_embeddings": failed_embeddings,
+                        "total_chunks": len(chunks),
+                    },
+                )
 
 
 def _docling_worker_process(file_path: str, conn: Connection) -> None:
@@ -948,10 +1514,43 @@ def _docling_worker_process(file_path: str, conn: Connection) -> None:
             {"PYTORCH_ENABLE_MPS_FALLBACK": "1", "PYTORCH_MPS_DISABLE": "1"}
         )
 
+    result = None
     try:
+        logger.info(f"Worker process started for file: {file_path}")
+
+        # Add a simple test to isolate Docling issues
+        logger.info("Testing Docling imports...")
+
+        logger.info("Docling imports successful")
+
+        # Verify file exists and get basic info
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"Input file does not exist: {file_path}")
+
+        file_size = os.path.getsize(file_path)
+        logger.info(f"Processing file {file_path} (size: {file_size} bytes)")
+
+        # Test connection before starting
+        conn.send({"status": "worker_started", "file": file_path, "size": file_size})
+        logger.info("Worker connection test successful")
+
+        # Test basic Docling functionality before full processing
+        logger.info("Testing basic Docling DocumentConverter...")
+        DocumentConverter()
+        logger.info("DocumentConverter created successfully")
+
         # Create processor instance to use the common processing function
+        logger.info("Creating DocumentProcessor instance")
         processor = DocumentProcessor()
-        chunks_data = processor._process_with_docling(file_path)
+
+        logger.info("Starting Docling processing with progress tracking")
+        chunks_data = processor._process_with_docling(
+            file_path, conn, job_id=None
+        )  # Worker process doesn't have job_id context
+
+        logger.info(
+            f"Worker process completed successfully with {len(chunks_data)} chunks"
+        )
 
         # Prepare output for pipe communication
         out_chunks: List[Dict[str, Any]] = []
@@ -964,12 +1563,38 @@ def _docling_worker_process(file_path: str, conn: Connection) -> None:
                 }
             )
 
-        conn.send({"ok": True, "chunks": out_chunks})
-        conn.close()
+        result = {"ok": True, "chunks": out_chunks, "total_chunks": len(out_chunks)}
 
     except Exception as e:
+        error_msg = f"Docling worker process failed: {type(e).__name__}: {e}"
+        logger.error(error_msg)
+        logger.exception("Full exception details:")
+
+        # Get more detailed error information
+        import traceback
+
+        tb_str = traceback.format_exc()
+
+        result = {
+            "ok": False,
+            "error": error_msg,
+            "error_type": type(e).__name__,
+            "traceback": tb_str,
+            "file_path": file_path,
+            "file_size": (
+                os.path.getsize(file_path) if os.path.exists(file_path) else "unknown"
+            ),
+        }
+
+    finally:
+        # Always try to send the result
+        if result is not None:
+            try:
+                conn.send(result)
+                logger.info("Worker sent final result")
+            except Exception as send_e:
+                logger.error(f"Failed to send final result to parent: {send_e}")
         with contextlib.suppress(Exception):
-            conn.send({"ok": False, "error": f"{type(e).__name__}: {e}"})
             conn.close()
 
 
@@ -1002,35 +1627,68 @@ class FallbackDocumentProcessor:
         Returns:
             List of processed chunks with metadata
         """
+        job_id = params.get("job_id")
+
         try:
             if original_filename is None:
                 original_filename = _extract_original_filename(file_path, params)
 
+            # Update progress at start of fallback processing
+            if job_id:
+                from app.main import update_job_progress
+
+                update_job_progress(
+                    job_id,
+                    f"Fallback: Extracting text from {original_filename}",
+                    15,
+                    {
+                        "current_operation": "Fallback text extraction",
+                        "fallback_method": "basic_extraction",
+                    },
+                )
+
             file_ext = os.path.splitext(file_path)[1].lower()
             content = ""
             if file_ext == ".pdf":
-                content = self._extract_text_from_pdf(file_path)
+                logger.info("Fallback: Extracting text from PDF")
+                content = self._extract_text_from_pdf(file_path, job_id)
             elif file_ext == ".docx":
+                logger.info("Fallback: Extracting text from DOCX")
                 content = self._extract_text_from_docx(file_path)
             elif file_ext in [".txt", ".html"]:
+                logger.info("Fallback: Reading text file")
                 with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
                     content = f.read()
             elif file_ext in [".jpg", ".jpeg", ".png"]:
+                logger.info("Fallback: Extracting text from image")
                 content = self._extract_text_from_image(file_path)
             else:
+                logger.info("Fallback: Using default content")
                 content = f"Content from {original_filename}"
+
+            # Update progress after text extraction
+            if job_id:
+                update_job_progress(
+                    job_id,
+                    "Fallback: Creating document chunks",
+                    75,
+                    {
+                        "current_operation": "Fallback chunking",
+                        "extracted_content_length": len(content),
+                    },
+                )
 
             page_info = {"original_filename": original_filename, "pages": [1]}
             chunks = self._chunk_content(content, original_filename, page_info)
 
             # Generate embeddings if requested
             if params.get("with_embeddings", False) and chunks:
-                self._attach_embeddings(chunks)
+                self._attach_embeddings(chunks, job_id)
 
             return chunks
 
         except Exception as e:
-            logger.error("Fallback processing failed for %s: %s", file_path, e)
+            logger.exception("Fallback processing failed for %s: %s", file_path, e)
             return [
                 ChunkResult(
                     id=f"chunk_{uuid.uuid4().hex}",
@@ -1043,31 +1701,68 @@ class FallbackDocumentProcessor:
                 )
             ]
 
-    def _attach_embeddings(self, chunks: List[ChunkResult]) -> None:
+    def _attach_embeddings(
+        self, chunks: List[ChunkResult], job_id: Optional[str] = None
+    ) -> None:
         """Generate embeddings for chunks using the external embedding service.
 
         Args:
             chunks: List of chunks to generate embeddings for
+            job_id: Job ID for progress tracking (optional)
         """
         try:
             texts = [c.text for c in chunks]
 
             # Use the embedding client to generate embeddings
+            logger.info(f"Generating embeddings for {len(texts)} chunks...")
             embeddings = embedding_client.generate_embeddings(texts)
 
             # Assign embeddings to chunks
             for chunk, embedding in zip(chunks, embeddings):
                 chunk.embeddings = embedding
 
+            # Update progress after successful embedding generation
+            if job_id:
+                from app.main import update_job_progress
+
+                update_job_progress(
+                    job_id,
+                    "Fallback: Embeddings generated successfully",
+                    95,
+                    {
+                        "current_operation": "Embeddings completed",
+                        "embeddings_count": len(embeddings),
+                    },
+                )
+
         except Exception as e:
-            logger.error("Embedding generation failed: %s", e)
+            logger.exception("Embedding generation failed: %s", e)
+
+            # Update progress to indicate embedding failure
+            if job_id:
+                from app.main import update_job_progress
+
+                update_job_progress(
+                    job_id,
+                    "Fallback: Embedding generation failed",
+                    90,
+                    {
+                        "current_operation": "Embeddings failed",
+                        "error_type": type(e).__name__,
+                        "error_message": str(e),
+                    },
+                )
+
             # Continue without embeddings rather than failing the whole job
 
-    def _extract_text_from_pdf(self, file_path: str) -> str:
-        """Extract text from PDF using PyPDF2.
+    def _extract_text_from_pdf(
+        self, file_path: str, job_id: Optional[str] = None
+    ) -> str:
+        """Extract text from PDF using PyPDF2 with progress tracking.
 
         Args:
             file_path: Path to the PDF file
+            job_id: Job ID for progress tracking (optional)
 
         Returns:
             Extracted text content
@@ -1078,8 +1773,31 @@ class FallbackDocumentProcessor:
             text = ""
             with open(file_path, "rb") as file:
                 reader = PyPDF2.PdfReader(file)
-                for page in reader.pages:
-                    text += page.extract_text() or ""
+                total_pages = len(reader.pages)
+
+                for i, page in enumerate(reader.pages):
+                    page_text = page.extract_text() or ""
+                    text += page_text
+
+                    # Update progress every page or every 5 pages for large documents
+                    if job_id and (i % 5 == 0 or i == total_pages - 1):
+                        progress = 15 + int(
+                            (i + 1) / total_pages * 60
+                        )  # 15-75% range for PDF extraction
+                        from app.main import update_job_progress
+
+                        update_job_progress(
+                            job_id,
+                            f"Fallback: Extracting PDF text (page {i + 1}/{total_pages})",
+                            progress,
+                            {
+                                "current_operation": "PDF text extraction",
+                                "pages_processed": i + 1,
+                                "total_pages": total_pages,
+                                "stage": "pdf_extraction",
+                            },
+                        )
+
             return text
         except ImportError:
             logger.warning("PyPDF2 not available for PDF extraction")
@@ -1152,11 +1870,11 @@ class FallbackDocumentProcessor:
             List of chunks with metadata
         """
         chunks: List[ChunkResult] = []
-        start = 0
-        n = len(content or "")
+        start: int = 0
+        n: int = len(content or "")
 
         while start < n:
-            end = min(start + chunk_size, n)
+            end: int = min(start + chunk_size, n)
 
             if end < n:
                 break_pos = content.rfind(" ", start, end)
@@ -1176,7 +1894,7 @@ class FallbackDocumentProcessor:
                     ChunkResult(id=chunk_id, metadata=metadata, text=chunk_text)
                 )
 
-            new_start = end - overlap
+            new_start: int = end - overlap
             start = end if new_start <= start else new_start
             if start <= 0:
                 start = end
