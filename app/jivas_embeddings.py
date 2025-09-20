@@ -29,7 +29,7 @@ class JivasEmbeddings(Embeddings):
         self.api_key = api_key
 
         # create client
-        job_timeout = os.getenv("JOB_TIMEOUT", "14400")
+        job_timeout = int(os.getenv("JOB_TIMEOUT", "14400"))
         self.client = OpenAI(api_key=api_key, base_url=base_url, timeout=job_timeout)
 
         # Load the tokenizer
