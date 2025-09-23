@@ -32,7 +32,7 @@ class EmbeddingClient:
                 )
                 logger.info("JivasEmbeddings client initialized successfully")
             except Exception as e:
-                logger.error(f"Failed to initialize JivasEmbeddings: {e}")
+                logger.exception(f"Failed to initialize JivasEmbeddings: {e}")
                 self.client = None
         else:
             logger.warning("Embedding service not configured (missing URL or API key)")
@@ -48,7 +48,7 @@ class EmbeddingClient:
             embeddings = self.client.embed_documents(texts, handle_overflow=True)
             return embeddings
         except Exception as e:
-            logger.error(f"Error generating embeddings: {e}")
+            logger.exception(f"Error generating embeddings: {e}")
             raise
 
     def generate_embedding(self, text: str) -> Optional[List[float]]:
@@ -62,7 +62,7 @@ class EmbeddingClient:
             embedding = self.client.embed_query(text, handle_overflow=True)
             return embedding
         except Exception as e:
-            logger.error(f"Error generating embedding for text: {e}")
+            logger.exception(f"Error generating embedding for text: {e}")
             return None
 
 

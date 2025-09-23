@@ -1,11 +1,15 @@
 """Module for Jivas Embeddings."""
 
 import json
+import logging
+import os
 from typing import List
 
 from langchain_core.embeddings import Embeddings
 from openai import OpenAI
 from transformers import AutoTokenizer
+
+logger = logging.getLogger(__name__)
 
 
 class JivasEmbeddings(Embeddings):
@@ -25,7 +29,8 @@ class JivasEmbeddings(Embeddings):
         self.api_key = api_key
 
         # create client
-        self.client = OpenAI(api_key=api_key, base_url=base_url)
+        job_timeout = int(os.getenv("JOB_TIMEOUT", "14400"))
+        self.client = OpenAI(api_key=api_key, base_url=base_url, timeout=job_timeout)
 
         # Load the tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(model)
@@ -58,7 +63,7 @@ class JivasEmbeddings(Embeddings):
             return [embd["embedding"] for embd in response["data"]]
         except Exception as e:
             # Handle potential errors
-            print(f"Error embedding documents: {e}")
+            logger.exception(f"Error embedding documents: {e}")
             return []
 
     def embed_query(self, text: str, handle_overflow: bool = False) -> List[float]:
@@ -75,5 +80,5 @@ class JivasEmbeddings(Embeddings):
             return response["data"][0]["embedding"]
         except Exception as e:
             # Handle potential errors
-            print(f"Error embedding query: {e}")
+            logger.exception(f"Error embedding query: {e}")
             return []
