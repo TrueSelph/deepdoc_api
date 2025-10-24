@@ -1,0 +1,126 @@
+{
+  "status": "completed",
+  "result": [
+    {
+      "id": "chunk_29eef17a3f4e419f932ca360dde24fd6",
+      "metadata": {
+        "page_num_int": [1],
+        "original_filename": "QualiTEST Prospective Students Information January 2026.pdf",
+        "bbox": null,
+        "chunk_size": 315,
+        "chunk_overlap": 0,
+        "hierarchy": [],
+        "headings": ["390 Ganges Street Prashad Nagar, Georgetown, Guyana"],
+        "chunker_type": "toc"
+      },
+      "text": "390 Ganges Street Prashad Nagar, Georgetown, Guyana\n\n1\n390 Ganges Street Prashad Nagar, Georgetown, Guyana\nRegistered Training Provider - National Accreditation Council of Guyana (NAC) Affiliated with the American Medical Technologists\n\nEmpowering Allied Health Professionals Through Quality Training and Excellence",
+      "embeddings": null
+    },
+    {
+      "id": "chunk_dcf84229301b4799a8458d02b34f2db6",
+      "metadata": {
+        "page_num_int": [1],
+        "original_filename": "QualiTEST Prospective Students Information January 2026.pdf",
+        "bbox": null,
+        "chunk_size": 423,
+        "chunk_overlap": 0,
+        "hierarchy": [],
+        "headings": [
+          "Information for Prospective Students - January 2026 Intake"
+        ],
+        "chunker_type": "toc"
+      },
+      "text": "Information for Prospective Students - January 2026 Intake\n\n1\nInformation for Prospective Students - January 2026 Intake\nQualiTEST Incorporated invites applications for our upcoming Allied Health Training Programs beginning in January 2026. Our programs are designed to prepare students for meaningful careers in healthcare through high-quality academic instruction, hands-on practical training, and national certification.",
+      "embeddings": null
+    },
+    {
+      "id": "chunk_f5312e430781415e89136e0d9f904d17",
+      "metadata": {
+        "page_num_int": [1],
+        "original_filename": "QualiTEST Prospective Students Information January 2026.pdf",
+        "bbox": null,
+        "chunk_size": 718,
+        "chunk_overlap": 0,
+        "hierarchy": [],
+        "headings": ["Entry Requirements"],
+        "chunker_type": "toc"
+      },
+      "text": "Entry Requirements\n\n1\nEntry Requirements\nTo be eligible for registration, applicants must possess a minimum of three (3) or four (4) Caribbean Examinations Council (CXC) subjects, as outlined below:\n\nProgram\n\nMinimum CXC Subjects\n\nRequired\n\nMandatory Subjects\n\nPhlebotomy - 6 months\n\n3 CXCs\n\nEnglish, Mathematics,\n\nScience\n\nPatient Care Technician -\n\n8 months\n\n3 CXCs\n\nEnglish, Mathematics,\n\nScience\n\nMedical Assistant - 1 year\n\n4 CXCs\n\nEnglish, Mathematics,\n\nScience\n\nMedical Laboratory\n\nAssistant - 1 year\n\n4 CXCs\n\nEnglish, Mathematics,\n\nScience\n\nNote : Individuals currently working in healthcare may be considered for admission based on relevant experience, even if they do not meet the full academic requirements.",
+      "embeddings": null
+    },
+    {
+      "id": "chunk_b9ad1125718a4a5b8f0aec6895fe1bde",
+      "metadata": {
+        "page_num_int": [1],
+        "original_filename": "QualiTEST Prospective Students Information January 2026.pdf",
+        "bbox": null,
+        "chunk_size": 350,
+        "chunk_overlap": 0,
+        "hierarchy": [],
+        "headings": ["Important Dates"],
+        "chunker_type": "toc"
+      },
+      "text": "Important Dates\n\n1\nImportant Dates\nOrientation: Mid-November 2025\n\nProgram Commencement: January 2026\n\nOrientation is mandatory before registration and gives prospective students an opportunity to:\n\nLearn about each program and its career pathways\n\nMeet instructors and staff\n\nUnderstand the registration process, tuition, and blended learning format",
+      "embeddings": null
+    },
+    {
+      "id": "chunk_9ea4b24e2d444700ac5a72fc820211e4",
+      "metadata": {
+        "page_num_int": [1],
+        "original_filename": "QualiTEST Prospective Students Information January 2026.pdf",
+        "bbox": null,
+        "chunk_size": 489,
+        "chunk_overlap": 0,
+        "hierarchy": [],
+        "headings": ["Learning Format"],
+        "chunker_type": "toc"
+      },
+      "text": "Learning Format\n\n2\nLearning Format\nOur programs are delivered through a blended learning model, combining:\n\nOnline classes via our interactive e-learning platform for theoretical components\n\nIn-person practical training at our clinical classroom and laboratory\n\nExternship/clinical rotation at partnering hospitals and health institutions nationwide\n\nThis approach ensures flexibility, hands-on competence, and real-world experience essential for success in today's healthcare environment.",
+      "embeddings": null
+    },
+    {
+      "id": "chunk_3675f0c8ac2c4bdb8fd2e3381f41f5d1",
+      "metadata": {
+        "page_num_int": [1],
+        "original_filename": "QualiTEST Prospective Students Information January 2026.pdf",
+        "bbox": null,
+        "chunk_size": 340,
+        "chunk_overlap": 0,
+        "hierarchy": [],
+        "headings": ["Why Choose QualiTEST?"],
+        "chunker_type": "toc"
+      },
+      "text": "Why Choose QualiTEST?\n\n2\nWhy Choose QualiTEST?\nRegistered to national standards and affiliated internationally with AMT\n\nHighly qualified instructors and mentors\n\nPractical, competency-based training\n\nJob placement and externship partnerships across Guyana\n\nSupportive learning environment fostering quality, professionalism, and confidence",
+      "embeddings": null
+    },
+    {
+      "id": "chunk_fe16317a25bb4f5890ed330282932f8c",
+      "metadata": {
+        "page_num_int": [1],
+        "original_filename": "QualiTEST Prospective Students Information January 2026.pdf",
+        "bbox": null,
+        "chunk_size": 158,
+        "chunk_overlap": 0,
+        "hierarchy": [],
+        "headings": ["389 Registration link:"],
+        "chunker_type": "toc"
+      },
+      "text": "389 Registration link:\n\n2\n389 Registration link:\nhttps://docs.google.com/forms/d/e/1FAIpQLScPS6jXgCL2wgfTibBGGimech0IS55UAIVxz2yZwDrJ7O26Q/viewform?usp=header",
+      "embeddings": null
+    }
+  ],
+  "error": "",
+  "stage": "Job completed - 7 chunks, 5.7s, 0.0 MB/hr",
+  "progress": 100,
+  "details": {
+    "total_files": 1,
+    "processed_files": 1,
+    "total_chunks": 7,
+    "embeddings_generated": false,
+    "total_file_size_bytes": 0,
+    "total_file_size_mb": 0.0,
+    "processing_time_seconds": 5.7,
+    "throughput_mb_per_hour": 0.0,
+    "chunks_per_second": 1.23
+  }
+}

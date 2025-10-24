@@ -2,6 +2,7 @@ fastapi
 uvicorn[standard]>=0.24.0
 python-multipart>=0.0.6
 docling[all]>=2.47.1
+onnxruntime>=1.15.0
 transformers
 requests
 pydantic

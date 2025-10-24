@@ -535,7 +535,7 @@ async def trigger_callback(job_id: str, callback_url: str) -> None:
         }
 
         response = requests.post(
-            callback_url, json=payload, headers=headers, timeout=15
+            callback_url, json=payload, headers=headers, timeout=1440
         )
 
         # Log the response for debugging
@@ -610,7 +610,11 @@ async def upload_and_chunk_endpoint(
     lang: str = Body("english"),  # noqa: B008
     with_embeddings: bool = Body(False),  # noqa: B008
     callback_url: str | None = Body(None),  # noqa: B008
+    chunker_type: str = Body("hybrid"),  # noqa: B008
 ) -> Dict[str, str]:
+    logger.warning("##############")
+    logger.warning(f"chunker_type: {chunker_type}")
+    logger.warning("##############")
     """Endpoint to process files asynchronously from uploads or URLs"""
     # Generate job ID
     job_id = str(uuid.uuid4())
@@ -675,6 +679,7 @@ async def upload_and_chunk_endpoint(
         "callback_url": callback_url,
         "original_filenames": original_filenames,  # Pass the filename mapping
         "job_id": job_id,  # Pass job_id for progress tracking
+        "chunker_type": chunker_type
     }
 
     if with_embeddings:
