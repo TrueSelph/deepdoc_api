@@ -610,6 +610,7 @@ async def upload_and_chunk_endpoint(
     lang: str = Body("english"),  # noqa: B008
     with_embeddings: bool = Body(False),  # noqa: B008
     callback_url: str | None = Body(None),  # noqa: B008
+    chunker_type: str = Body("hybrid"),  # noqa: B008
 ) -> Dict[str, str]:
     """Endpoint to process files asynchronously from uploads or URLs"""
     # Generate job ID
@@ -675,6 +676,7 @@ async def upload_and_chunk_endpoint(
         "callback_url": callback_url,
         "original_filenames": original_filenames,  # Pass the filename mapping
         "job_id": job_id,  # Pass job_id for progress tracking
+        "chunker_type": chunker_type,
     }
 
     if with_embeddings:
