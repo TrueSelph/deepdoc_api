@@ -24,6 +24,10 @@ class ChunkMetadata(BaseModel):
     bbox: Optional[Dict[str, float]] = None
     chunk_size: Optional[int] = None
     chunk_overlap: Optional[int] = None
+    # TOC chunker specific fields
+    hierarchy: Optional[List[str]] = None
+    headings: Optional[List[str]] = None
+    chunker_type: Optional[str] = None
 
 
 class ChunkResult(BaseModel):

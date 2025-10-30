@@ -414,7 +414,13 @@ code {{ white-space: pre-wrap; }}
 
 
 class DocumentProcessor:
-    """Document processor using Docling's DocumentConverter and HybridChunker."""
+    """Document processor using Docling's DocumentConverter and configurable chunkers.
+
+    Supports three chunker types:
+    - hybrid: Default semantic chunking with HybridChunker
+    - hierarchical: Hierarchical chunking preserving document structure
+    - toc: Table of Contents based chunking using custom TOCChunker
+    """
 
     def __init__(self) -> None:
         """Initialize the DocumentProcessor with supported formats and thread pool."""
@@ -433,11 +439,18 @@ class DocumentProcessor:
         self.document_converter = DocumentConverter()
 
     def process_document(self, file_path: str, params: dict) -> List[ChunkResult]:
-        """Process a single document using Docling's DocumentConverter and HybridChunker.
+        r"""Process a single document using Docling's DocumentConverter and selected chunker.
 
         Args:
             file_path: Path to the document file
-            params: Processing parameters dictionary
+            params: Processing parameters dictionary containing:
+                - chunker_type: "hybrid" (default), "hierarchical", or "toc"
+                - toc_params: Dict with TOC chunker configuration:
+                    - section_pattern: Regex pattern for section detection (default: r'^(\d+(?:\.\d+)*)')
+                    - approved_sections: List of approved sections to chunk (optional)
+                - with_embeddings: Boolean to generate embeddings
+                - timeout_seconds: Processing timeout
+                - job_id: For progress tracking
 
         Returns:
             List of processed chunks with metadata
@@ -466,6 +479,7 @@ class DocumentProcessor:
                 original_filename=original_filename,
                 timeout_seconds=timeout_seconds,
                 job_id=job_id,
+                params=params,
             )
             if not chunks:
                 raise RuntimeError("Docling worker returned no chunks")
@@ -516,7 +530,11 @@ class DocumentProcessor:
             )
 
     def _process_with_docling(
-        self, file_path: str, conn: Connection, job_id: Optional[str] = None
+        self,
+        file_path: str,
+        conn: Connection,
+        job_id: Optional[str] = None,
+        params: Optional[dict] = None,
     ) -> List[Dict[str, Any]]:
         """Common function to process document using Docling with PDF conversion.
 
@@ -535,6 +553,8 @@ class DocumentProcessor:
         try:
             from docling.chunking import HybridChunker
             from docling.document_converter import DocumentConverter
+
+            from app.toc_chunker import TOCChunker
         except ImportError as e:
             raise ImportError(f"Required Docling components not available: {e}")
 
@@ -638,9 +658,58 @@ class DocumentProcessor:
             except Exception as progress_e:
                 logger.warning(f"Failed to send document_loaded progress: {progress_e}")
 
-            # Create chunker and generate chunks with progress tracking
-            chunker = HybridChunker()
-            chunk_iter = chunker.chunk(dl_doc=doc)
+            # Determine chunker type from params (params is available here)
+            chunker_type = (params or {}).get("chunker_type", "hybrid").lower()
+
+            # Create appropriate chunker based on type with error handling
+            try:
+                if chunker_type == "hierarchical":
+                    from docling.chunking import HierarchicalChunker
+
+                    chunker = HierarchicalChunker()
+                    logger.info("Using HierarchicalChunker for document processing")
+                    chunk_iter = chunker.chunk(dl_doc=doc)
+                elif chunker_type == "toc":
+                    # Initialize TOCChunker with configurable parameters
+                    # toc_params = params.get("toc_params", {})
+                    toc_params = (params or {}).get("toc_params", {})
+                    section_pattern = toc_params.get(
+                        "section_pattern", r"^(\d+(?:\.\d+)*)"
+                    )
+                    approved_sections = toc_params.get("approved_sections")
+                    chunker = TOCChunker()
+                    chunker.section_pattern = (
+                        section_pattern  # Set the pattern directly
+                    )
+                    logger.info("Using TOCChunker for document processing")
+
+                    # Use approved_sections in chunk method if provided
+                    if approved_sections:
+                        chunk_iter = chunker.chunk(
+                            dl_doc=doc, approved_sections=approved_sections
+                        )
+                    else:
+                        chunk_iter = chunker.chunk(dl_doc=doc)
+                elif chunker_type == "hybrid":
+                    chunker = HybridChunker()
+                    logger.info("Using HybridChunker for document processing")
+                    chunk_iter = chunker.chunk(dl_doc=doc)
+                else:
+                    logger.warning(
+                        f"Unknown chunker_type '{chunker_type}', falling back to hybrid"
+                    )
+                    chunker = HybridChunker()
+                    logger.info(
+                        "Using HybridChunker (fallback) for document processing"
+                    )
+                    chunk_iter = chunker.chunk(dl_doc=doc)
+            except Exception as chunker_error:
+                logger.error(
+                    f"Failed to initialize {chunker_type} chunker: {chunker_error}"
+                )
+                logger.info("Falling back to HybridChunker")
+                chunker = HybridChunker()
+                chunk_iter = chunker.chunk(dl_doc=doc)
 
             chunks_data: List[Dict[str, Any]] = []
             processed_elements = 0
@@ -655,15 +724,16 @@ class DocumentProcessor:
                 total_elements = doc_stats.get("elements", 0)
 
             for chunk in chunk_iter:
-                # Use contextualized text for better results
-                enriched_text = chunker.contextualize(chunk=chunk)
-                text = (enriched_text or "").strip()
+                # Use contextualized text for better results (only for Docling chunkers)
+                if hasattr(chunker, "contextualize") and chunker_type != "toc":
+                    enriched_text = chunker.contextualize(chunk=chunk)
+                    text = (enriched_text or "").strip()
+                else:
+                    # TOCChunker doesn't have contextualize method, use text directly
+                    text = (chunk.text or "").strip()
 
                 if not text:
-                    # Fallback to regular text if contextualization returns empty
-                    text = (chunk.text or "").strip()
-                    if not text:
-                        continue
+                    continue
 
                 # Extract page information
                 pages = self._collect_chunk_pages(chunk)
@@ -676,7 +746,14 @@ class DocumentProcessor:
                     "pages": pages,
                     "bbox": bbox_data,
                     "original_format": original_format,
+                    "chunker_type": chunker_type,
                 }
+
+                if chunker_type == "toc" and hasattr(chunk.meta, "hierarchy"):
+                    chunk_data["hierarchy"] = chunk.meta.hierarchy
+                    if hasattr(chunk.meta, "headings"):
+                        chunk_data["headings"] = chunk.meta.headings
+
                 chunks_data.append(chunk_data)
 
                 # Update progress based on actual processing
@@ -1049,6 +1126,7 @@ class DocumentProcessor:
         original_filename: str,
         timeout_seconds: int,
         job_id: Optional[str] = None,  # Pass job_id for progress updates
+        params: Optional[dict] = None,  # Pass params to worker
     ) -> List[ChunkResult]:
         """Run Docling processing with timeout using multiprocessing.
 
@@ -1070,7 +1148,7 @@ class DocumentProcessor:
         parent_conn, child_conn = ctx.Pipe(duplex=False)
         proc = ctx.Process(
             target=_docling_worker_process,
-            args=(file_path, child_conn),
+            args=(file_path, child_conn, params),
             daemon=True,
         )
         proc.start()
@@ -1186,7 +1264,7 @@ class DocumentProcessor:
                         logger.info(
                             f"Docling processing progress: {int(elapsed)}/{timeout_seconds}s ({progress}%)"
                         )
-            print(f"Docling worker result: {result}")
+            logger.info(f"Docling worker result: {result}")
         finally:
             if proc.is_alive():
                 proc.terminate()
@@ -1275,17 +1353,33 @@ class DocumentProcessor:
                 self._collect_bounding_box(ch) if not isinstance(ch, dict) else None
             )
             chunk_id = f"chunk_{uuid.uuid4().hex}"
+
+            # Extract TOC-specific fields from chunk data
+            toc_hierarchy = None
+            toc_headings = None
+            toc_chunker_type = None
+            if isinstance(ch, dict):
+                toc_hierarchy = ch.get("hierarchy")
+                toc_headings = ch.get("headings")
+                toc_chunker_type = ch.get("chunker_type")
+
             meta = ChunkMetadata(
                 page_num_int=pages or [1],
                 original_filename=original_filename,
                 chunk_size=len(text),
                 chunk_overlap=0,
+                hierarchy=toc_hierarchy,
+                headings=toc_headings,
+                chunker_type=toc_chunker_type,
             )
             # Add bounding box to metadata if available
             if bbox_data:
                 meta.bbox = bbox_data
 
-            chunks.append(ChunkResult(id=chunk_id, metadata=meta, text=text))
+            # Create ChunkResult with metadata containing TOC fields
+            chunk_result = ChunkResult(id=chunk_id, metadata=meta, text=text)
+
+            chunks.append(chunk_result)
 
         return chunks
 
@@ -1498,7 +1592,9 @@ class DocumentProcessor:
                 )
 
 
-def _docling_worker_process(file_path: str, conn: Connection) -> None:
+def _docling_worker_process(
+    file_path: str, conn: Connection, params: Optional[dict] = None
+) -> None:
     """Worker process entrypoint for Docling processing.
 
     Args:
@@ -1542,7 +1638,7 @@ def _docling_worker_process(file_path: str, conn: Connection) -> None:
 
         logger.info("Starting Docling processing with progress tracking")
         chunks_data = processor._process_with_docling(
-            file_path, conn, job_id=None
+            file_path, conn, job_id=None, params=params
         )  # Worker process doesn't have job_id context
 
         logger.info(
@@ -1556,6 +1652,9 @@ def _docling_worker_process(file_path: str, conn: Connection) -> None:
                 {
                     "text": chunk_data["text"],
                     "pages": chunk_data["pages"],
+                    "hierarchy": chunk_data.get("hierarchy", []),
+                    "headings": chunk_data.get("headings", []),
+                    "chunker_type": chunk_data.get("chunker_type", "hybrid"),
                     "chunk_index": i,
                 }
             )
