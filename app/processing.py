@@ -20,6 +20,15 @@ from app.models import ChunkMetadata, ChunkResult
 
 logger = logging.getLogger(__name__)
 
+# Import Mineru LayoutProcessor
+try:
+    from app.mineru_adapter.layout_processor import LayoutProcessor
+except ImportError:
+    logger.warning(
+        "Mineru LayoutProcessor not found. Mineru chunking will not be available."
+    )
+    LayoutProcessor = None  # type: ignore
+
 # Reduce thread contention that can contribute to stalls with some backends
 os.environ.update(
     {"OMP_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"}
@@ -438,13 +447,18 @@ class DocumentProcessor:
         self.embedding_executor = ThreadPoolExecutor(max_workers=3)
         self.document_converter = DocumentConverter()
 
+        # Initialize Mineru LayoutProcessor if available
+        self.mineru_processor = (
+            LayoutProcessor() if LayoutProcessor is not None else None
+        )
+
     def process_document(self, file_path: str, params: dict) -> List[ChunkResult]:
         r"""Process a single document using Docling's DocumentConverter and selected chunker.
 
         Args:
             file_path: Path to the document file
             params: Processing parameters dictionary containing:
-                - chunker_type: "hybrid" (default), "hierarchical", or "toc"
+                - chunker_type: "hybrid" (default), "hierarchical", "toc", or "mineru"
                 - toc_params: Dict with TOC chunker configuration:
                     - section_pattern: Regex pattern for section detection (default: r'^(\d+(?:\.\d+)*)')
                     - approved_sections: List of approved sections to chunk (optional)
@@ -472,6 +486,71 @@ class DocumentProcessor:
         # use the multiprocessing approach with timeout
         job_timeout = os.getenv("JOB_TIMEOUT", "14400")
         timeout_seconds = max(10, int(params.get("timeout_seconds", job_timeout)))
+
+        # Check for Mineru chunker type
+        chunker_type = params.get("chunker_type", "hybrid").lower()
+        if chunker_type == "mineru":
+            if not self.mineru_processor:
+                raise ValueError(
+                    "Mineru chunker requested but LayoutProcessor is not available."
+                )
+
+            try:
+                chunks = self._process_with_mineru(
+                    file_path=file_path,
+                    original_filename=original_filename,
+                    job_id=job_id,
+                    params=params,
+                )
+
+                # Generate embeddings if requested
+                if params.get("with_embeddings", False) and chunks:
+                    if job_id:
+                        from app.main import log_progress_milestone
+
+                        log_progress_milestone(
+                            job_id, "Starting embedding generation", 75
+                        )
+                    self._attach_embeddings(chunks, job_id)
+
+                logger.info(
+                    "Successfully processed document with Mineru into %d chunks",
+                    len(chunks),
+                )
+
+                # Log successful completion milestone
+                if job_id:
+                    from app.main import log_progress_milestone
+
+                    log_progress_milestone(
+                        job_id,
+                        f"Document processing completed: {len(chunks)} chunks",
+                        90,
+                    )
+
+                return chunks
+
+            except Exception as e:
+                logger.exception(
+                    "Mineru processing failed for %s: %s. Falling back to Docling.",
+                    file_path,
+                    e,
+                )
+                # Fallback to Docling if Mineru fails
+                if job_id:
+                    from app.main import update_job_progress
+
+                    update_job_progress(
+                        job_id,
+                        "Mineru processing failed, falling back to standard processing",
+                        10,
+                        {
+                            "current_operation": "Fallback processing",
+                            "fallback_reason": str(type(e).__name__),
+                            "original_error": str(e),
+                        },
+                    )
+                # Continue to standard Docling processing below
 
         try:
             chunks = self._run_docling_with_timeout(
@@ -829,6 +908,132 @@ class DocumentProcessor:
             if temp_pdf_path and os.path.exists(temp_pdf_path):
                 with contextlib.suppress(OSError):
                     os.unlink(temp_pdf_path)
+
+    def _process_with_mineru(
+        self,
+        file_path: str,
+        original_filename: str,
+        job_id: Optional[str] = None,
+        params: Optional[dict] = None,
+    ) -> List[ChunkResult]:
+        """Process document using Mineru LayoutProcessor.
+
+        Args:
+            file_path: Path to the document file
+            original_filename: Original filename
+            job_id: Job ID for progress tracking
+            params: Processing parameters
+
+        Returns:
+            List of ChunkResult objects
+        """
+        import json
+        import shutil
+
+        # Create a unique output directory for this processing job
+        # Use job_id if available, otherwise a random UUID
+        process_id = job_id or uuid.uuid4().hex
+        output_base_path = os.path.join(
+            os.path.dirname(file_path), f"mineru_out_{process_id}"
+        )
+        os.makedirs(output_base_path, exist_ok=True)
+
+        try:
+            logger.info(
+                f"Starting Mineru processing for {file_path} to {output_base_path}"
+            )
+
+            # Update progress
+            if job_id:
+                from app.main import update_job_progress
+
+                update_job_progress(
+                    job_id,
+                    "Running Mineru layout analysis",
+                    20,
+                    {"current_operation": "Mineru processing"},
+                )
+
+            # Run Mineru processing
+            # Note: process_document in LayoutProcessor takes input_path, output_base_path, max_pages
+            self.mineru_processor.process_document(
+                file_path,
+                output_base_path,
+                max_pages=params.get("max_pages", 100) if params else 100,
+            )
+
+            # Locate the output file
+            # Mineru structure: output_base_path / filename_stem / processed.json
+            filename_stem = Path(file_path).stem
+            processed_json_path = os.path.join(
+                output_base_path, filename_stem, "processed.json"
+            )
+
+            if not os.path.exists(processed_json_path):
+                # Try looking directly in output_base_path (fallback)
+                processed_json_path = os.path.join(output_base_path, "processed.json")
+
+            if not os.path.exists(processed_json_path):
+                raise FileNotFoundError(
+                    f"Mineru output file not found at {processed_json_path}"
+                )
+
+            # Read and parse the output
+            with open(processed_json_path, "r", encoding="utf-8") as f:
+                mineru_data = json.load(f)
+
+            # Convert to ChunkResult objects
+            chunks = []
+            for idx, item in enumerate(mineru_data):
+                content = item.get("content", "").strip()
+                if not content:
+                    continue
+
+                # Extract page info
+                page_str = item.get("page", "1")
+                page_nums = []
+                try:
+                    if "-" in str(page_str):
+                        start, end = map(int, str(page_str).split("-"))
+                        page_nums = list(range(start, end + 1))
+                    else:
+                        page_nums = [int(page_str)]
+                except (ValueError, TypeError):
+                    page_nums = [1]
+
+                # Create metadata
+                metadata = ChunkMetadata(
+                    page_num_int=page_nums,
+                    original_filename=original_filename,
+                    chunker_type="mineru",
+                    hierarchy=item.get("hierarchy"),
+                    # Mineru specific fields can be added to metadata if needed
+                )
+
+                # Create ChunkResult
+                chunk_id = f"{process_id}_{idx}"
+                chunk = ChunkResult(
+                    id=chunk_id,
+                    metadata=metadata,
+                    text=content,
+                    embeddings=None,  # Will be added later if requested
+                )
+                chunks.append(chunk)
+
+            return chunks
+
+        finally:
+            # Clean up the output directory
+            try:
+                if os.path.exists(output_base_path):
+                    shutil.rmtree(output_base_path)
+                    logger.info(
+                        f"Cleaned up Mineru output directory: {output_base_path}"
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to clean up Mineru output directory {output_base_path}: {e}"
+                )
 
     def _collect_chunk_pages(self, dl_chunk: object) -> List[int]:
         """Collect 1-based page numbers from a docling chunk.
