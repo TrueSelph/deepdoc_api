@@ -1,5 +1,5 @@
 # Build stage
-FROM python:3.10-slim as builder
+FROM python:3.11-slim as builder
 
 WORKDIR /app
 
@@ -12,13 +12,16 @@ RUN apt-get update && apt-get install -y \
 
 # Copy requirements
 COPY requirements.txt .
+COPY app/mineru_adapter/requirements.txt ./mineru-requirements.txt
 
 # Install dependencies globally (not with --user)
+# Install Mineru dependencies first (they are heavier)
+RUN pip install --no-cache-dir -r mineru-requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
 
 # Runtime stage
-FROM python:3.10-slim
+FROM python:3.11-slim
 
 WORKDIR /app
 
