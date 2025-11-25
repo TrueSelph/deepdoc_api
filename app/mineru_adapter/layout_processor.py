@@ -1,18 +1,27 @@
-import os
-import sys
+"""
+Layout processor module for handling document layout data from MinerU.
+
+This module provides the LayoutProcessor class, which processes and formats
+document layout data extracted by MinerU, including combining split PDFs,
+extracting text content with hierarchy, and handling various block types
+such as titles, text, lists, and tables.
+"""
+
 import json
-import subprocess
 import logging
-from pathlib import Path
-from dotenv import load_dotenv
+import os
+import subprocess
 from collections import Counter
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 
 class LayoutProcessor:
+    """Layout processor class for handling document layout data from MinerU."""
+
     # formatting document
-    def combine_split_pdfs(self, layouts_list):
+    def combine_split_pdfs(self, layouts_list: list) -> dict:
         """
         Combines multiple layout data objects (each representing a split PDF part)
         into a single layout data object with sequential page indices.
@@ -37,10 +46,12 @@ class LayoutProcessor:
 
         return {"pdf_info": combined_data}
 
-    def process_layout(self, layout_data):
+    def process_layout(self, layout_data: dict) -> list:
         """
         Processes the layout data to extract and chunk text content,
         handling hierarchy and ignoring repetitive headers.
+        This version merges and sorts all block types (para_blocks and preproc_blocks)
+        before processing.
 
         Args:
             layout_data (dict): The layout data dictionary containing "pdf_info".
@@ -51,33 +62,45 @@ class LayoutProcessor:
         extracted_data = []
         ignored_list = []
 
-        # Get the pdf_info list
         pdf_info = layout_data.get("pdf_info", [])
 
-        # Iterate through each page
         for page in pdf_info:
             page_idx = page.get("page_idx", 0) + 1
 
-            # Iterate through each para_block in the page
-            para_blocks = page.get("para_blocks", [])
-            if not para_blocks:
-                para_blocks = page.get("preproc_blocks", [])
-            for item in para_blocks:
+            # Combine para_blocks, preproc_blocks, and discarded_blocks and sort them by bbox (y0, x0)
+            all_blocks = []
+            if "para_blocks" in page:
+                all_blocks.extend(page["para_blocks"])
+            if "preproc_blocks" in page:
+                all_blocks.extend(page["preproc_blocks"])
+            if "discarded_blocks" in page:
+                all_blocks.extend(page["discarded_blocks"])
+
+            # Sort blocks by their top‑left corner (y0, then x0)
+            # Assuming bbox is [x0, y0, x1, y1]
+            all_blocks.sort(
+                key=lambda b: (
+                    b.get("bbox", [0, 0, 0, 0])[1],
+                    b.get("bbox", [0, 0, 0, 0])[0],
+                )
+            )
+
+            for item in all_blocks:
                 item_type = item.get("type", "")
                 lines = item.get("lines", [])
 
-                # Process title and text items
                 if item_type in ["title", "text"]:
                     for line in lines:
                         for span in line.get("spans", []):
                             data = {
                                 "page": str(page_idx),
                                 "content": span.get("content", ""),
-                                "type": item_type
+                                "type": item_type,
                             }
                             extracted_data.append(data)
+                            # Collect content for ignored_list (headers)
+                            ignored_list.append(span.get("content", ""))
 
-                # Process list items
                 elif item_type == "list":
                     blocks = item.get("blocks", [])
                     for block in blocks:
@@ -86,131 +109,100 @@ class LayoutProcessor:
                                 data = {
                                     "page": str(page_idx),
                                     "content": span.get("content", ""),
-                                    "type": item_type
+                                    "type": item_type,
                                 }
                                 extracted_data.append(data)
 
-                # Process table items
                 elif item_type == "table":
                     blocks = item.get("blocks", [])
                     for block in blocks:
                         for line in block.get("lines", []):
                             for span in line.get("spans", []):
-                                # For tables, we might want to extract the HTML content
                                 if span.get("type") == "table":
                                     table_content = span.get("html", "")
-                                    # Extract text from HTML or use the image path
                                     data = {
                                         "page": str(page_idx),
                                         "content": table_content,
                                         "type": item_type,
-                                        "image_path": span.get("image_path", "")
+                                        "image_path": span.get("image_path", ""),
                                     }
                                     extracted_data.append(data)
 
-            # get the headers
-            para_blocks = page.get("para_blocks", [])
-            if not para_blocks:
-                para_blocks = page.get("preproc_blocks", [])
-            for item in para_blocks:
-                item_type = item.get("type", "")
-                lines = item.get("lines", [])
-
-                # Process title and text items
-                if item_type in ["title", "text"]:
-                    for line in lines:
-                        for span in line.get("spans", []):
-                            ignored_list.append(span.get("content", ""))
-
-        # count the headers
-        # Count occurrences of each item
+        # Count occurrences of each item to identify repetitive headers
         count = Counter(ignored_list)
         max_occurrences = 3
-
-        # Create list of items that appear more than max_occurrences times
         ignored_list = [item for item, cnt in count.items() if cnt > max_occurrences]
 
-        formatted_extracted_data = []
-        last_data_type = ""
-        main_title = False
-        hierarchy = []
+        formatted_extracted_data: list = []
+        last_data_type: str = ""
+        main_title: bool = False
+        hierarchy: list = []
 
-        # format the extracted data
         for data in extracted_data:
-
-            if data['type'] == "title" and data['content'] not in ignored_list:
-
+            if data["type"] == "title" and data["content"] not in ignored_list:
                 if hierarchy and last_data_type != "title":
                     if main_title and len(hierarchy) > 1:
                         hierarchy = hierarchy[:-1]
                         if len(hierarchy) > 2:
                             hierarchy = hierarchy[-1:]
-
                         main_title = False
                     else:
                         hierarchy.pop()
                 else:
                     main_title = True
-                hierarchy.append(data['content'])
-            elif (data['type'] == last_data_type and formatted_extracted_data) or (last_data_type == "text" and data["type"] == "list"):
-                # Note: Added parentheses for clarity in condition above, matching original logic
-                # Original: elif data['type'] == last_data_type and formatted_extracted_data or last_data_type == "text" and data["type"] == "list":
-                # Python operator precedence: 'and' binds tighter than 'or'.
-                # So it means: (data['type'] == last_data_type and formatted_extracted_data) OR (last_data_type == "text" and data["type"] == "list")
-
+                hierarchy.append(data["content"])
+            elif (data["type"] == last_data_type and formatted_extracted_data) or (
+                last_data_type == "text" and data["type"] == "list"
+            ):
                 last_data = formatted_extracted_data.pop()
                 last_data["content"] += "\n" + data["content"]
 
                 last_page_idx = last_data["page"]
                 page_idx = str(data["page"])
                 if last_page_idx != page_idx:
-                    # Check if already a range
                     if " - " in last_page_idx:
                         last_page_idx = last_page_idx.split(" - ")[0]
                     last_data["page"] = last_page_idx + " - " + page_idx
 
                 formatted_extracted_data.append(last_data)
             else:
-                data['hierarchy'] = hierarchy.copy()
+                data["hierarchy"] = hierarchy.copy()
                 hierarchy_str = " >> ".join(hierarchy)
-                data['content'] = hierarchy_str + "\n" + data['content']
+                data["content"] = hierarchy_str + "\n" + data["content"]
                 formatted_extracted_data.append(data)
-
 
             last_data_type = data["type"]
 
         return formatted_extracted_data
 
-    def process_single_document(self, input_file, output_file="output_single.json"):
-        """
-        Processes a single layout.json file.
-        """
+    def process_single_document(
+        self, input_file: str, output_file: str = "output_single.json"
+    ) -> None:
+        """Processes a single layout.json file."""
 
         if not os.path.exists(input_file):
             print(f"Input file not found: {input_file}")
             return
 
-        with open(input_file, 'r', encoding='utf-8') as f:
+        with open(input_file, "r", encoding="utf-8") as f:
             layout_data = json.load(f)
-
 
         formatted_data = self.process_layout(layout_data)
 
-        with open(output_file, 'w', encoding='utf-8') as f:
+        with open(output_file, "w", encoding="utf-8") as f:
             json.dump(formatted_data, f, ensure_ascii=False, indent=2)
 
-
-    def process_split_document(self, split_folder, output_file="output_combined.json"):
-        """
-        Processes a folder containing split PDF layout files.
-        """
+    def process_split_document(
+        self, split_folder: list, output_file: str = "output_combined.json"
+    ) -> list:
+        """Processes a folder containing split PDF layout files."""
 
         layouts_list = []
         for item in split_folder:
             path = os.path.join(item)
             if os.path.exists(path):
                 try:
-                    with open(path, 'r', encoding='utf-8') as file:
+                    with open(path, "r", encoding="utf-8") as file:
                         data = json.load(file)
                         layouts_list.append(data)
                 except Exception as e:
@@ -220,19 +212,18 @@ class LayoutProcessor:
 
         if not layouts_list:
             print("No layout data found.")
-            return
-
+            return []
 
         combined_layout = self.combine_split_pdfs(layouts_list)
 
         formatted_data = self.process_layout(combined_layout)
 
-        with open(output_file, 'w', encoding='utf-8') as f:
+        with open(output_file, "w", encoding="utf-8") as f:
             json.dump(formatted_data, f, ensure_ascii=False, indent=2)
-
+        return formatted_data
 
     # process document
-    def run_mineru(self, input_path, output_path):
+    def run_mineru(self, input_path: str, output_path: str) -> None:
         """
         Runs the mineru command with the specified input and output paths.
 
@@ -254,25 +245,27 @@ class LayoutProcessor:
                 stderr=subprocess.STDOUT,
                 text=True,
                 bufsize=1,
-                universal_newlines=True
+                universal_newlines=True,
             )
-            
+
             # # Read and log output line by line
             # for line in process.stdout:
             #     print(f"Mineru: {line.strip()}", flush=True)
-                
+
             # Wait for completion
             return_code = process.wait()
-            
+
             if return_code != 0:
                 raise subprocess.CalledProcessError(return_code, command)
-                
-        except subprocess.CalledProcessError as e:
+
+        except subprocess.CalledProcessError:
             print(f"Error executing Mineru command for {input_path}:")
             # print(e.stderr) # stderr is already merged into stdout
             raise
 
-    def process_document(self, input_path, output_base_path, max_pages=100):
+    def process_document(
+        self, input_path: str, output_base_path: str, max_pages: int = 100
+    ) -> None:
         """
         Process a document with Mineru, automatically splitting it if it's too large.
 
@@ -281,31 +274,37 @@ class LayoutProcessor:
             output_base_path (str): Base path for output directory.
             max_pages (int): Maximum number of pages per document before splitting.
         """
-        input_path = Path(input_path)
+        full_input_path: Path = Path(input_path)
 
-        if not input_path.exists():
-            print(f"Error: Input file {input_path} does not exist")
+        if not full_input_path.exists():
+            print(f"Error: Input file {full_input_path} does not exist")
             return
-
 
         split_dir = []
         # Check if document needs splitting (PDF only)
-        if input_path.suffix.lower() == '.pdf':
-            split_output_dir = ""
-            final_dir = ""
+        if full_input_path.suffix.lower() == ".pdf":
+            split_output_dir: Path | None = None
+            final_dir: Path | None = None
             try:
                 import PyPDF2
-                with open(input_path, 'rb') as file:
+
+                with open(full_input_path, "rb") as file:
                     pdf_reader = PyPDF2.PdfReader(file)
                     total_pages = len(pdf_reader.pages)
 
                     if total_pages > max_pages:
 
                         # Create output directories
-                        document_name = input_path.stem
-                        split_output_dir = Path(output_base_path) / document_name / "split_output"
-                        final_dir = Path(output_base_path) / document_name / "processed.json"
-                        split_docs_dir = Path(output_base_path) / document_name / "split_documents"
+                        document_name = full_input_path.stem
+                        split_output_dir = (
+                            Path(output_base_path) / document_name / "split_output"
+                        )
+                        final_dir = (
+                            Path(output_base_path) / document_name / "processed.json"
+                        )
+                        split_docs_dir = (
+                            Path(output_base_path) / document_name / "split_documents"
+                        )
 
                         # Split and process each chunk
                         for start_page in range(0, total_pages, max_pages):
@@ -317,26 +316,46 @@ class LayoutProcessor:
                                 pdf_writer.add_page(pdf_reader.pages[page_num])
 
                             # Save split document
-                            split_filename = f"{document_name}_pages_{start_page+1}-{end_page}.pdf"
+                            split_filename = (
+                                f"{document_name}_pages_{start_page + 1}-{end_page}.pdf"
+                            )
                             split_file_path = split_docs_dir / split_filename
                             split_docs_dir.mkdir(parents=True, exist_ok=True)
 
-                            with open(split_file_path, 'wb') as output_file:
+                            with open(split_file_path, "wb") as output_file:
                                 pdf_writer.write(output_file)
 
                             # Process split with Mineru
-                            split_output_path = split_output_dir / f"{document_name}_pages_{start_page+1}-{end_page}"
-                            self.run_mineru(str(split_file_path), str(split_output_path))
+                            # split_output_dir is definitely a Path here
+                            if split_output_dir:
+                                split_output_path = (
+                                    split_output_dir
+                                    / f"{document_name}_pages_{start_page + 1}-{end_page}"
+                                )
+                                self.run_mineru(
+                                    str(split_file_path), str(split_output_path)
+                                )
 
-                            split_name = split_output_path.name
-                            split_output_layout = split_output_path / split_name / "auto" / f"{split_name}_middle.json"
-                            split_output_format_layout = split_output_dir / f"{document_name}_pages_{start_page+1}-{end_page}.json"
+                                split_name = split_output_path.name
+                                split_output_layout = (
+                                    split_output_path
+                                    / split_name
+                                    / "auto"
+                                    / f"{split_name}_middle.json"
+                                )
+                                split_output_format_layout = (
+                                    split_output_dir
+                                    / f"{document_name}_pages_{start_page + 1}-{end_page}.json"
+                                )
 
-                            self.process_single_document(split_output_layout, split_output_format_layout)
-                            split_dir.append(split_output_layout)
+                                self.process_single_document(
+                                    str(split_output_layout),
+                                    str(split_output_format_layout),
+                                )
+                                split_dir.append(split_output_layout)
 
-
-                        self.process_split_document(split_dir, final_dir)
+                        if final_dir:
+                            self.process_split_document(split_dir, str(final_dir))
                         return
 
             except ImportError:
@@ -345,9 +364,14 @@ class LayoutProcessor:
                 print(f"Error processing PDF: {e}")
 
         # If no splitting needed or not a PDF, process normally
-        document_output_dir = Path(output_base_path) / input_path.stem
-        self.run_mineru(str(input_path), str(document_output_dir))
-        output_layout = document_output_dir / input_path.stem / "auto" / f"{input_path.stem}_middle.json"
+        document_output_dir = Path(output_base_path) / full_input_path.stem
+        self.run_mineru(str(full_input_path), str(document_output_dir))
+        output_layout = (
+            document_output_dir
+            / full_input_path.stem
+            / "auto"
+            / f"{full_input_path.stem}_middle.json"
+        )
         output_format_layout = document_output_dir / "processed.json"
 
-        self.process_single_document(output_layout, output_format_layout)
+        self.process_single_document(str(output_layout), str(output_format_layout))
