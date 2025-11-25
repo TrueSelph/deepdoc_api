@@ -1015,7 +1015,7 @@ class DocumentProcessor:
                 chunk = ChunkResult(
                     id=chunk_id,
                     metadata=metadata,
-                    text=content,
+                    text=original_filename + " >> " + content,
                     embeddings=None,  # Will be added later if requested
                 )
                 chunks.append(chunk)
